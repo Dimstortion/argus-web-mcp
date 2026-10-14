@@ -1,6 +1,6 @@
 """Tiered HTML -> article extraction.
 
-Tier 1  trafilatura      (precision-favouring, primary)
+Tier 1  trafilatura      (balanced, primary; recall-favouring when clean=False)
 Tier 2  readability-lxml -> markdownify   (fallback when tier 1 is empty)
 Tier 3  markdownify(html)                 (last resort)
 
@@ -23,6 +23,7 @@ import lxml.html
 import trafilatura
 from markdownify import markdownify as _md
 from readability import Document
+from trafilatura.settings import DEFAULT_CONFIG
 
 from .links import pdf_links
 
@@ -83,7 +84,6 @@ def _readability_markdown(html: str) -> str:
     return _md(summary_html, heading_style="ATX").strip()
 
 
-_RECALL_GAIN = 1.3  # balanced replaces precision only when it has this much more text
 _LANG = re.compile(r"(?:^|\s)(?:language|lang|highlight(?:-source)?)-([\w+#.-]+)")
 # Wrappers only count through Sphinx's highlight-<lang>: a page-level class such as
 # <body class="lang-en"> or "language-selector" is not a code language.
@@ -93,6 +93,7 @@ _NOT_A_LANG = {"default", "none", "text", "plain", "plaintext"}
 # the lazy patterns go quadratic-to-cubic on long runs of backticks or brackets (5000
 # backticks took 7.7 s, 100k brackets 55 s, holding the GIL). No real code line is this long.
 _MAX_REGEX_LINE = 2000
+_MIN_EXTRACTED = DEFAULT_CONFIG.getint("DEFAULT", "MIN_EXTRACTED_SIZE")  # 250 chars
 _LINK = re.compile(r"!?\[([^\]\n]{0,500})\]\([^)\s]{0,2000}\)")
 _IMG_IN_LINK = re.compile(r"\[!\[([^\]\n]{0,500})\]\([^)\s]{0,2000}\)\]\([^)\s]{0,2000}\)")
 _FENCE = re.compile(r"^(`{3,})\n(.*?)\n\1$", re.M | re.S)
@@ -310,15 +311,17 @@ def extract_article(
             ).strip()
         )
 
-    # Precision keeps the page's markdown structure (links, paragraphs) but drops content
-    # on non-article pages; balanced finds that content but can flatten a small page into
-    # one paragraph. Keep precision unless balanced recovers clearly more text. WCXB
-    # (2026-10-02, 50 pages/type): precision alone 0.684 F1, balanced alone 0.715.
-    content = _tier1(clean)
-    if clean:
-        balanced = _tier1(False)
-        if len(balanced.split()) > _RECALL_GAIN * len(content.split()):
-            content = balanced
+    # One balanced pass. The precision-then-balanced pair it replaces was measured on the
+    # full WCXB dev split (1497 pages, 2026-10-15): pair 0.817 F1 / 463 s, balanced alone
+    # 0.819 F1 / 309 s, keeping more headings, lines and links, not fewer. The one place
+    # balanced loses structure is a tiny result: below MIN_EXTRACTED_SIZE trafilatura swaps
+    # in its flat `baseline()` text (links and paragraph breaks gone), which precision mode
+    # skips; so only there run precision too and keep it unless balanced has clearly more.
+    content = _tier1(False)
+    if clean and len(content) < _MIN_EXTRACTED:
+        precise = _tier1(True)
+        if len(precise.split()) * 1.3 >= len(content.split()):
+            content = precise
 
     # Tier 2: readability.
     if not content:

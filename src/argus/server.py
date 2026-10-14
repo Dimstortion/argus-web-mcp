@@ -36,10 +36,11 @@ from starlette.responses import JSONResponse, PlainTextResponse
 from . import __version__, config, reachability, semantic
 from .cache import Cache, ttl_for
 from .config import HEALTH_LATENCY_BUCKETS, PDF_EXECUTOR, TIMEOUTS, clamp_timeout
-from .extract.article import extract_article
+from .extract import pool as extract_pool
 from .extract.links import extract_links_images
 from .extract.llm import extract_llm, llm_available
 from .extract.pdf import extract_pdf, extract_pdf_quality
+from .extract.pool import extract_async
 from .extract.structured import extract_selectors
 from .fetch import static as static_fetch
 from .fetch.core import fetch
@@ -264,6 +265,7 @@ async def lifespan(_server: FastMCP):
     # doesn't eat the one-time ~5s HF model load. Best-effort: never blocks/fails startup
     # (no-op when the [semantic] extra is absent).
     warm_task = asyncio.create_task(asyncio.to_thread(semantic.warm))
+    extract_pool.warm()
     watch_task = asyncio.create_task(_watch_loop())
     reach_task = asyncio.create_task(_reach_loop())
     try:
@@ -282,6 +284,7 @@ async def lifespan(_server: FastMCP):
             await _S.browser.stop()
         await _S.client.aclose()
         _S.cache.close()
+        extract_pool.shutdown()
         _S = None
 
 
@@ -401,8 +404,8 @@ async def read(
             return _timeout_err("read", timeout + _READ_GRACE_S)
         return _fetch_err(e)
 
-    art = await asyncio.to_thread(extract_article, res["html"], res["final_url"], fmt=format,
-                                  clean=clean, include_links=include_links)
+    art = await extract_async(res["html"], res["final_url"], fmt=format, clean=clean,
+                              include_links=include_links)
     if not art["content"]:
         return err("empty_content", "no extractable content", res["final_url"])
 
@@ -600,7 +603,7 @@ async def scrape(
     except FetchError as e:
         return _fetch_err(e, "render failed", "render_failed")
 
-    art = await asyncio.to_thread(extract_article, res["html"], res["final_url"], fmt=format)
+    art = await extract_async(res["html"], res["final_url"], fmt=format)
     # Raw page HTML must not pass as markdown/text (a blank SPA shell or a challenge page);
     # a screenshot call still returns its PNG.
     if not art["content"] and not screenshot:
@@ -731,7 +734,7 @@ async def extract_structured(
             mode == "auto" and (result is None or not result["valid"]) and llm_available()
         )
         if need_llm:
-            art = await asyncio.to_thread(extract_article, res["html"], res["final_url"])
+            art = await extract_async(res["html"], res["final_url"])
             content = art["content"] or res["html"]
             llm_schema = schema if mode == "llm" else dict.fromkeys(schema, "str")
             try:
@@ -1039,7 +1042,7 @@ async def find_similar(url_or_text: str, count: int = 10) -> dict:
                 return _ssrf_err(e, "URL")
             except FetchError as e:
                 return _fetch_err(e)
-            art = await asyncio.to_thread(extract_article, res["html"], res["final_url"])
+            art = await extract_async(res["html"], res["final_url"])
             # The multilingual MiniLM was trained on short paraphrase pairs, so the lead of
             # the article represents the page better than 3000 chars (or, worse, raw HTML).
             seed_text = f"{art['title'] or ''} {(art['content'] or '')[:_SEED_CHARS]}"

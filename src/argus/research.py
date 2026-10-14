@@ -30,8 +30,8 @@ from collections.abc import Awaitable, Callable
 from urllib.parse import urlsplit
 
 from .config import PDF_EXECUTOR
-from .extract.article import extract_article
 from .extract.pdf import extract_pdf
+from .extract.pool import extract_async
 from .fetch.core import fetch as _default_fetch
 from .fetch.static import FetchError
 from .fetch.static import fetch_bytes as _default_fetch_bytes
@@ -188,7 +188,7 @@ async def _read_one_inner(url, *, fetch_fn, fetch_bytes_fn, client, browser, tim
         # test/fake fetch_fns don't take a throttle kwarg. None (tests) => no-op, stays green.
         _extra = {"throttle": throttle} if throttle is not None else {}
         res = await fetch_fn(url, client=client, browser=browser, timeout=timeout, **_extra)
-        art = await asyncio.to_thread(extract_article, res["html"], res["final_url"])
+        art = await extract_async(res["html"], res["final_url"])
     except (SSRFError, FetchError) as exc:
         return {"url": url, "ok": False, "error": getattr(exc, "code", "fetch_failed")}
     except ValueError:  # extract_pdf('not_pdf'): a non-PDF body at a .pdf URL

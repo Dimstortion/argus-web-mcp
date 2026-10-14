@@ -414,17 +414,6 @@ def test_malformed_jsonld_is_ignored():
 # --- thin precision result -> balanced pass ----------------------------------------
 
 
-def _fake_tier1(monkeypatch, precise: str, balanced: str) -> list:
-    calls = []
-
-    def fake_extract(*a, **k):
-        calls.append(k["favor_precision"])
-        return precise if k["favor_precision"] else balanced
-
-    monkeypatch.setattr(art.trafilatura, "extract", fake_extract)
-    return calls
-
-
 def test_malformed_jsonld_type_does_not_fail_the_read():
     html = ('<html><head><script type="application/ld+json">'
             '[{"@type": {"x": 1}}, {"@type": ["Article", {"y": 2}], "author": {"name": 7}}]'
@@ -562,25 +551,31 @@ def test_demark_linked_badge_and_language_wrappers():
     assert _code_langs('<div class="highlight-default"><pre>z</pre></div>') == {"z": ""}
 
 
-def test_balanced_replaces_precision_only_with_clearly_more_text(monkeypatch):
-    # Precision keeps markdown structure; balanced wins only when it recovers >1.3x text
-    # (WCXB: forum/collection pages). clean=False is a single recall-leaning pass.
+def test_tier1_is_one_balanced_pass_except_tiny_results(monkeypatch):
+    # One trafilatura call per page (WCXB dev: balanced alone beats precision+balanced on
+    # F1 at two thirds of the time). Below MIN_EXTRACTED_SIZE trafilatura's balanced mode
+    # returns flat baseline text, so precision runs too and wins unless clearly shorter.
     import trafilatura
 
     from argus.extract import article
 
     seen = []
+    out = {True: "prec " * 20, False: "bal " * 20}
 
     def fake(html, **kw):
         seen.append((kw.get("favor_precision"), kw.get("favor_recall")))
-        return ("prec " * 100) if kw.get("favor_precision") else ("bal " * n)
+        return out[kw.get("favor_precision")]
 
     monkeypatch.setattr(trafilatura, "extract", fake)
     page = "<html><body><p>x</p></body></html>"
-    n = 120  # 1.2x: precision kept
     assert article.extract_article(page, "https://e.com/")["content"].startswith("prec")
-    n = 200  # 2x: balanced wins
+    assert seen == [(False, False), (True, False)]
+    out[True] = "prec " * 10  # precision clearly shorter: balanced kept
     assert article.extract_article(page, "https://e.com/")["content"].startswith("bal")
+    out[False] = "bal " * 100  # a normal-sized result: single pass
+    seen.clear()
+    article.extract_article(page, "https://e.com/")
+    assert seen == [(False, False)]
     seen.clear()
     article.extract_article(page, "https://e.com/", clean=False)
     assert seen == [(False, True)]

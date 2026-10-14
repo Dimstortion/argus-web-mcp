@@ -14,6 +14,40 @@ All notable changes, in [Keep a Changelog](https://keepachangelog.com/) style. D
 
 ---
 
+## [0.4.29] - 2026-10-15 - extraction tuned by measurement: off the GIL, one trafilatura pass
+
+Profiled the read path on real pages (ESP-IDF, Python docs, GitHub, news; 140-520 KB):
+`extract_article` cost 0.35-1.5 s of pure CPU per page, almost all of it trafilatura's
+pruning, and nothing else on the path was above 25 ms. Two changes, both measured.
+
+### Performance
+
+- **Extraction worker processes** (`extract/pool.py`, `ARGUS_EXTRACT_WORKERS`, default
+  `min(2, CPUs)`, `0` = thread). trafilatura is pure Python, so `asyncio.to_thread` never
+  ran pages in parallel: 10 pages took 10.5 s sequentially, 10.7 s on 2 threads and 14.0 s
+  on 4 (GIL thrash), against 6.3 s on 2 processes. `research(deep)` and `batch_read` fan
+  out 5-8 extractions at once, so on the 2-vCPU VPS they were slower than serial and
+  starved the event loop (health, other tools). Workers are spawned, never forked (the
+  parent runs ONNX and Chromium threads), import only the extract package (~55 MB each),
+  are warmed at startup and rebuilt once if one dies (OOM kill). The suite runs with
+  `ARGUS_EXTRACT_WORKERS=0` (a spawned worker would not see monkeypatches); one test
+  exercises a real worker.
+- **One trafilatura pass instead of two.** The precision-then-balanced pair from 0.4.22
+  was re-measured on the full WCXB dev split (1497 pages): pair 0.815 F1 / 471 s,
+  balanced alone 0.817 F1 / 287 s (-39%, p95 per page 0.99 -> 0.62 s), and balanced keeps
+  *more* headings, lines and links on a 240-page sample, not fewer. The one real loss was
+  tiny results: below trafilatura's `MIN_EXTRACTED_SIZE` (250 chars) its balanced mode
+  swaps in flat `baseline()` text (paragraph breaks and links gone), which precision mode
+  skips, so only there precision runs too (35 of 1497 pages, +1.5 s total). A visible-text
+  gate for the balanced pass was simulated first and rejected: every threshold cost F1
+  (0.817 -> 0.810 at best).
+
+### Not changed, measured
+
+`visible_text_len` 5-11 ms, `_looks_blocked` 14-25 ms, semantic rerank 50-130 ms for
+10-30 hits, cache put 3 ms per 200 KB: none worth touching. `_metadata` is ~30% of a page
+(trafilatura's own date/author search); left as is.
+
 ## [0.4.28] - 2026-10-14 - production audit: event-loop DoS, decompression bomb, fail-closed auth, actionable errors
 
 Three independent reviews (security, code quality, performance) plus the 2026-10-04

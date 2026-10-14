@@ -7,11 +7,15 @@ gives the same end-to-end coverage (tool -> fetch -> extract -> cache) fully off
 """
 
 import ipaddress
+import os
 import socket
 
 import httpx
 import pymupdf
 import pytest
+
+# Thread path for the suite: a spawned extraction worker would not see monkeypatches.
+os.environ.setdefault("ARGUS_EXTRACT_WORKERS", "0")
 
 ARTICLE_HTML = (
     "<html><head><title>Gold Outlook</title></head><body>"
