@@ -36,6 +36,22 @@ async def test_content_tools_raise_the_client_result_cap():
     assert "anthropic/maxResultSizeChars" not in (tools["search"].meta or {})
 
 
+async def test_entry_point_tools_are_always_loaded():
+    """Claude Code defers MCP tool schemas; the three entry points skip the lookup."""
+    tools = await _tools()
+    for name in ("read", "search", "research"):
+        assert (tools[name].meta or {}).get("anthropic/alwaysLoad") is True, name
+    assert "anthropic/alwaysLoad" not in (tools["unwatch"].meta or {})
+
+
+async def test_parameter_descriptions_reach_the_schema():
+    tools = await _tools()
+    props = tools["github_search"].parameters["properties"]
+    assert "stars" in props["sort"]["description"]
+    assert "clamped" in tools["search"].parameters["properties"]["count"]["description"]
+    assert "timeout" in tools["batch_read"].parameters["properties"]
+
+
 def test_single_version_source():
     pyproject = tomllib.loads(Path(__file__).parents[1].joinpath("pyproject.toml").read_text())
     assert pyproject["project"]["version"] == __version__

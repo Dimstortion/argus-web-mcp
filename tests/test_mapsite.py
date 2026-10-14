@@ -421,7 +421,7 @@ async def test_gzip_bomb_sitemap_skipped(monkeypatch):
     monkeypatch.setattr(static_mod, "MAX_FETCH_BYTES", 1024)
     import argus.mapsite as mapsite_mod
 
-    monkeypatch.setattr(mapsite_mod, "MAX_FETCH_BYTES", 1024)
+    monkeypatch.setattr(mapsite_mod, "_MAX_SITEMAP_BYTES", 1024)
     bomb = gzip.compress(b"<urlset>" + b"x" * 10_000 + b"</urlset>")
 
     def h(req):
@@ -437,6 +437,29 @@ async def test_gzip_bomb_sitemap_skipped(monkeypatch):
     async with _client(h) as c:
         res = await map_site("https://x.test/", client=c)
     assert res["source"] == "links"  # bomb skipped, discovery degraded gracefully
+
+
+async def test_oversized_plain_sitemap_skipped(monkeypatch):
+    """A plain (not gzipped) sitemap past _MAX_SITEMAP_BYTES is skipped too: ElementTree
+    expands it several-fold in memory, and discovery degrades to links."""
+    import argus.mapsite as mapsite_mod
+
+    monkeypatch.setattr(socket, "getaddrinfo", _gai({}))
+    monkeypatch.setattr(mapsite_mod, "_MAX_SITEMAP_BYTES", 1024)
+
+    def h(req):
+        p = req.url.path
+        if p == "/robots.txt":
+            return httpx.Response(200, text="Sitemap: https://x.test/sitemap.xml\n")
+        if p == "/sitemap.xml":
+            return httpx.Response(200, text=_sitemap([f"https://x.test/{i}" for i in range(99)]))
+        if p == "/":
+            return httpx.Response(200, text='<a href="https://x.test/fb">f</a>')
+        return httpx.Response(404)
+
+    async with _client(h) as c:
+        res = await map_site("https://x.test/", client=c)
+    assert res["source"] == "links"
 
 
 async def test_robots_sitemaps_are_capped(monkeypatch):

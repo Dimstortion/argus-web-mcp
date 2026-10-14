@@ -11,6 +11,7 @@ import hashlib
 import json
 import sqlite3
 import time
+import zlib
 from pathlib import Path
 from urllib.parse import urlsplit, urlunsplit
 
@@ -48,6 +49,9 @@ class Cache:
         # the loop; acceptable for current single-process use (ponytail: no threading).
         self.conn.execute("PRAGMA journal_mode=WAL")
         self.conn.execute("PRAGMA busy_timeout=5000")
+        # put() commits on the event loop; NORMAL skips the per-commit fsync (safe under
+        # WAL: a crash can lose the last entries, which a cache can afford).
+        self.conn.execute("PRAGMA synchronous=NORMAL")
         self.conn.execute(
             "CREATE TABLE IF NOT EXISTS entries ("
             "key TEXT PRIMARY KEY, payload TEXT NULL, blob_path TEXT NULL, "
@@ -76,7 +80,7 @@ class Cache:
                 raw = Path(blob_path).read_bytes()
                 try:
                     text = gzip.decompress(raw).decode("utf-8")
-                except (OSError, EOFError):
+                except (OSError, EOFError, zlib.error):  # zlib.error: corrupt deflate stream
                     text = raw.decode("utf-8")  # legacy uncompressed blob (pre-0.4.7)
                 return json.loads(text)
             return json.loads(payload)
@@ -101,11 +105,15 @@ class Cache:
         return self._load(key, row)
 
     def get_stale(self, key: str) -> dict | None:
-        """Return stored payload regardless of age, else None."""
+        """Return stored payload regardless of age (plus ``cached_at``, its epoch write
+        time, so a stale-serve can say how old it is), else None."""
         row = self.conn.execute(
-            "SELECT payload, blob_path FROM entries WHERE key=?", (key,)
+            "SELECT payload, blob_path, created FROM entries WHERE key=?", (key,)
         ).fetchone()
-        return self._load(key, row) if row is not None else None
+        if row is None:
+            return None
+        payload = self._load(key, row)
+        return None if payload is None else {**payload, "cached_at": row[2]}
 
     def purge(self, max_age_s: int = 7 * 86400) -> int:
         """Delete entries older than ``max_age_s`` (default 7 days, > every TTL so

@@ -119,6 +119,9 @@ async def test_browser_config_routes_everything_through_the_proxy():
     cfg = await egress.guarded_browser_config(headless=True, verbose=False)
     assert cfg.proxy_config.server == await egress.proxy_url()
     assert "--proxy-bypass-list=<-loopback>" in cfg.extra_args
+    # WebRTC is UDP and bypasses an HTTP proxy: page JS must not STUN at private ranges.
+    assert "--webrtc-ip-handling-policy=disable_non_proxied_udp" in cfg.extra_args
+    assert "--force-webrtc-ip-handling-policy" in cfg.extra_args
 
 
 async def test_pipe_survives_a_reset_peer():

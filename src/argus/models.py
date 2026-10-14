@@ -20,6 +20,9 @@ ERROR_CODES = frozenset(
         "render_failed",
         "blocked_by_antibot",
         "dns_failed",
+        # An exception a tool did not map itself (the middleware's last line of defence):
+        # the client gets this instead of FastMCP's raw str(exc).
+        "internal_error",
         # Trading-tool structured codes, surfaced verbatim (masking them as generic
         # fetch_failed hid actionable causes like a bad report_type or date range).
         "cot_bad_report_type",
@@ -45,12 +48,13 @@ class ToolError(BaseModel):
 ERR_COUNTS: dict[str, int] = {}
 
 
-def err(code: str, message: str, detail: str | None = None) -> dict:
-    """Structured error dict for an MCP tool. Use instead of raising to the client."""
+def err(code: str, message: str, detail: str | None = None, **extra) -> dict:
+    """Structured error dict for an MCP tool. Use instead of raising to the client.
+    ``extra`` adds actionable fields (``http_status``, ``reason``, ``retryable``)."""
     if code not in ERROR_CODES:  # explicit (not assert - survives `python -O`)
         raise ValueError(f"unknown error code: {code}")
     ERR_COUNTS[code] = ERR_COUNTS.get(code, 0) + 1
-    return ToolError(error=message, code=code, detail=detail).model_dump()
+    return {**ToolError(error=message, code=code, detail=detail).model_dump(), **extra}
 
 
 # Per-stage counts of pipeline decisions (fetch-ladder hops, search fallbacks) since

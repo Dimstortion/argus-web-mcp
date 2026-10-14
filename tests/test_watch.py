@@ -435,14 +435,61 @@ def test_persist_oserror_unlinks_temp_and_reraises(tmp_path, monkeypatch):
         assert not W.os.path.exists(path)  # temp cleaned up on failure
 
 
-async def test_check_selector_no_match_value_none(tmp_path):
+async def test_check_selector_no_match_is_an_error_not_a_whole_page_hash(tmp_path):
+    """A selector that matches nothing used to hash the whole page: one change event
+    when the element disappeared, then one on every ad/timestamp rotation."""
     s = _store(tmp_path)
     w = s.add("https://x.test/cal", ".missing", 300, "https://hook.test/in")
     fetch = FakeFetch(CHANGELOG_HTML)
     res = await check_watch(w, fetch_fn=fetch, now=100.0)
-    assert res["value"] is None
-    # value is None -> signature falls back to full content
-    assert res["new_hash"] == content_signature(CHANGELOG_HTML)
+    assert res == {"changed": False, "error": "selector_not_found"}
+
+
+async def test_poll_due_selector_miss_keeps_the_baseline(tmp_path, public_dns):
+    s = _store(tmp_path)
+    w = s.add("https://x.test/cal", "h1", 300, "https://hook.test/in")
+    s.update_state(w.id, content_signature(CHANGELOG_HTML, "v1"), 0.0)
+    fetch = FakeFetch("<html><body><p>no heading today</p></body></html>")
+    client = FakeClient(status_code=200)
+    results = await poll_due(s, fetch_fn=fetch, client=client, now=1000.0)
+    assert results[0]["error"] == "selector_not_found" and client.posts == []
+    assert s.list()[0].last_hash == content_signature(CHANGELOG_HTML, "v1")
+    assert s.list()[0].last_check == 1000.0
+
+
+async def test_check_wayback_copy_is_not_the_live_page(tmp_path):
+    s = _store(tmp_path)
+    w = s.add("https://x.test/cal", None, 300, "https://hook.test/in")
+    fetch = FakeFetch()
+    fetch.responses["https://x.test/cal"] = {"html": CHANGELOG_HTML2, "render_path": "archive"}
+    res = await check_watch(w, fetch_fn=fetch, now=100.0)
+    assert res == {"changed": False, "error": "archive_only"}
+
+
+async def test_poll_due_survives_a_delivery_crash(tmp_path, public_dns, monkeypatch):
+    s = _store(tmp_path)
+    bad = s.add("https://a.test/cal", None, 300, "https://hook.test/a")
+    good = s.add("https://b.test/cal", None, 300, "https://hook.test/b")
+    for w in (bad, good):
+        s.update_state(w.id, content_signature(CHANGELOG_HTML), 0.0)
+
+    async def crashing_deliver(webhook, payload, *, client):
+        if webhook.endswith("/a"):
+            raise ValueError("Port out of range 0-65535")
+        return True
+
+    monkeypatch.setattr(W, "deliver", crashing_deliver)
+    fetch = FakeFetch(CHANGELOG_HTML2)
+    results = await poll_due(s, fetch_fn=fetch, client=FakeClient(), now=1000.0)
+    by_id = {r["id"]: r for r in results}
+    assert by_id[bad.id]["delivered"] is False and by_id[good.id]["delivered"] is True
+    assert all(w.last_check == 1000.0 for w in s.list())
+
+
+def test_store_tolerates_a_damaged_row(tmp_path):
+    p = tmp_path / "watches.json"
+    p.write_text('[{"id": "x"}, 42]', encoding="utf-8")
+    assert WatchStore(path=str(p)).list() == []
 
 
 async def test_check_fetch_returns_no_content_key(tmp_path):

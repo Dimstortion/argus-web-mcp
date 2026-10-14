@@ -16,17 +16,21 @@ import hmac
 import json
 import logging
 import os
+import re
 import time
 from collections import deque
 from contextlib import asynccontextmanager
 from dataclasses import asdict, dataclass
 from pathlib import Path
-from typing import Literal
+from typing import Annotated, Literal
 from urllib.parse import urlsplit
 
+import httpx
 import mcp.types as mcp_types
 from fastmcp import Context, FastMCP
 from fastmcp.server.middleware import Middleware
+from fastmcp.tools import ToolResult
+from pydantic import Field
 from starlette.responses import JSONResponse, PlainTextResponse
 
 from . import __version__, config, reachability, semantic
@@ -42,6 +46,7 @@ from .fetch.core import fetch
 from .fetch.crawl import deep_crawl
 from .fetch.render import BrowserPool
 from .fetch.static import FetchError, fetch_bytes
+from .fetch.throttle import CircuitOpen
 from .gh_search import GitHubSearchError
 from .gh_search import github_search as _gh_search
 from .mapsite import MapError, map_site
@@ -58,7 +63,7 @@ from .trading.cot import cot_report as _cot_report
 from .trading.forexfactory import ForexFactoryError
 from .trading.forexfactory import forexfactory_calendar as _ff_calendar
 from .trading.news import news_sentiment_feed as _news_feed
-from .watch import WatchStore, poll_due
+from .watch import WatchStore, _select_value, poll_due
 
 # Injected into every client session, even when the tools themselves are deferred, so it
 # carries routing and the contract only; each tool's own description has the details.
@@ -128,8 +133,44 @@ def _ssrf_err(e: SSRFError, what: str = "URL") -> dict:
     """Error for an SSRF-gate refusal: a DNS failure is dns_failed (worth a retry), only a
     blocked address is ssrf_blocked. Both refuse the fetch."""
     if e.code == "dns_failed":
-        return err("dns_failed", "DNS resolution failed", _safe_detail(e))
-    return err("ssrf_blocked", f"{what} blocked by SSRF guard", _safe_detail(e))
+        return err("dns_failed", "DNS resolution failed", _safe_detail(e), retryable=True)
+    return err("ssrf_blocked", f"{what} blocked by SSRF guard", _safe_detail(e),
+               retryable=False)
+
+
+_RETRYABLE_REASONS = frozenset({"timeout", "transport", "circuit_open"})
+# A plain read may legitimately outlive its `timeout`: the ladder adds one browser rung
+# (45 s floor + 15 s grace) after the static hop. Past that it is a hang, not a fetch.
+_READ_GRACE_S = 45
+
+
+def _fetch_err(e: FetchError, message: str = "fetch failed",
+               default_code: str = "fetch_failed") -> dict:
+    """Actionable fetch error: ``http_status`` when the failure was a status answer, a
+    short ``reason`` and ``retryable`` (timeouts, transport errors, an open breaker, 5xx
+    and 429: yes; a wall, a 4xx, a negative-cache hit: no). ``detail`` stays sanitized."""
+    code = "blocked_by_antibot" if e.code == "blocked_by_antibot" else default_code
+    cause = e.__cause__
+    if e.status is not None:
+        reason = f"http_{e.status}"
+    elif "cached failure" in str(e):  # core._check_negative's own text, never remote text
+        reason = "cached_failure"
+    elif isinstance(cause, CircuitOpen):
+        reason = "circuit_open"
+    elif isinstance(cause, httpx.TimeoutException | TimeoutError):
+        reason = "timeout"
+    elif isinstance(cause, httpx.TransportError):
+        reason = "transport"
+    else:
+        reason = e.code
+    retryable = reason in _RETRYABLE_REASONS or (e.status or 0) >= 500 or e.status == 429
+    return err(code, message, _safe_detail(e), http_status=e.status, reason=reason,
+               retryable=retryable)
+
+
+def _timeout_err(what: str, seconds: float) -> dict:
+    return err("fetch_failed", f"{what} timed out", f"{seconds:g}s", reason="timeout",
+               retryable=True)
 
 
 async def _in_pdf_worker(fn, *args):
@@ -271,8 +312,8 @@ async def _watch_loop() -> None:
         await _watch_tick(s)
         if time.monotonic() - last_purge >= CACHE_PURGE_EVERY_S:
             last_purge = time.monotonic()
-            try:
-                n = s.cache.purge()
+            try:  # sqlite delete + a blob-dir sweep: off the loop
+                n = await asyncio.to_thread(s.cache.purge)
                 if n:
                     logger.info("cache purge: removed %d expired entries", n)
             except Exception as exc:  # noqa: BLE001 - purge is housekeeping, never fatal
@@ -346,18 +387,19 @@ async def read(
         return {**cached, "from_cache": True}
 
     try:
-        res = await fetch(url, client=s.client, browser=s.browser, timeout=timeout,
-                          throttle=s.throttle)
+        async with asyncio.timeout(timeout + _READ_GRACE_S):
+            res = await fetch(url, client=s.client, browser=s.browser, timeout=timeout,
+                              throttle=s.throttle)
     except SSRFError as e:
         return _ssrf_err(e, "URL")
-    except FetchError as e:
+    except (FetchError, TimeoutError) as e:
         stale = s.cache.get_stale(ck)
         if stale is not None:
-            return {**stale, "from_cache": True}
-        # Surface an anti-bot block as its own code (like scrape/screenshot) so the agent
-        # gets the actionable cause. Use the structured .code, not a message substring.
-        code = "blocked_by_antibot" if e.code == "blocked_by_antibot" else "fetch_failed"
-        return err(code, "fetch failed", _safe_detail(e))
+            # Flagged: an expired copy served because the live fetch failed, never silently.
+            return {**stale, "from_cache": True, "stale": True}
+        if isinstance(e, TimeoutError):
+            return _timeout_err("read", timeout + _READ_GRACE_S)
+        return _fetch_err(e)
 
     art = await asyncio.to_thread(extract_article, res["html"], res["final_url"], fmt=format,
                                   clean=clean, include_links=include_links)
@@ -381,13 +423,16 @@ async def read(
         out["images"] = media["images"]
         out["links_truncated"] = media["links_truncated"]
         out["images_truncated"] = media["images_truncated"]
-    s.cache.put(ck, out, source="general")
+    if res["render_path"] != "archive":  # a Wayback copy must not outlive the site's blip
+        s.cache.put(ck, out, source="general")
     return out
 
 
 async def search(
-    query: str | list[str],
-    count: int = 10,
+    query: Annotated[str | list[str], Field(description=(
+        "one query, or a list of query variants fanned out and rank-fused (RRF) into one "
+        "result set"))],
+    count: Annotated[int, Field(description="results wanted, 1-100 (clamped)")] = 10,
     category: Literal["general", "news", "science", "it"] = "general",
     time_range: Literal["day", "week", "month", "year"] | None = None,
     lang: str | None = None,
@@ -403,11 +448,17 @@ async def search(
         return err("schema_invalid", f"unknown category {category!r} (general|news|science|it)")
     if time_range is not None and time_range not in _VALID_TIME_RANGES:
         return err("schema_invalid", f"unknown time_range {time_range!r} (day|week|month|year)")
+    # Trust-boundary clamp: count only decides when paging stops (5 pages max anyway), but
+    # an unbounded value busted the cache key and reranked every page for nothing.
+    count = max(1, min(count, 100))
     qkey = query if isinstance(query, str) else " ".join(query)
     ck = s.cache.key(
         "search:" + qkey,
+        # "multi": ["a", "b"] fans out as two RRF-merged searches, "a b" is one query -
+        # different result sets, so they must not share a cache row.
         {"count": count, "category": category, "time_range": time_range, "lang": lang,
-         "inc": include_domains, "exc": exclude_domains, "safe": safesearch},
+         "inc": include_domains, "exc": exclude_domains, "safe": safesearch,
+         "multi": not isinstance(query, str)},
     )
     cached = s.cache.get(ck, ttl_for("search"))
     if cached is not None:
@@ -435,7 +486,9 @@ async def search(
 
 async def read_pdf(
     url_or_path: str = "",
-    pages: str | None = None,
+    pages: Annotated[str | None, Field(description=(
+        "1-based page spec like '1-3,7' (default: all, capped at 300); use it for large "
+        "PDFs instead of raising timeout"))] = None,
     mode: Literal["text", "tables", "quality"] = "text",
     timeout: int = TIMEOUTS["read_pdf"],
     url: str | None = None,
@@ -471,22 +524,31 @@ async def read_pdf(
     except SSRFError as e:
         return _ssrf_err(e, "URL")
     except FetchError as e:
-        return err("fetch_failed", "fetch failed", _safe_detail(e))
+        return _fetch_err(e)
 
     if len(data) > MAX_PDF_BYTES:
         return err("parse_failed", "PDF too large", f"{len(data)} bytes")
 
     try:
-        if mode == "quality":
-            try:
-                result = await _in_pdf_worker(extract_pdf_quality, data, pages)  # Docling
-            except ImportError:
-                # The deployed image leaves out the heavy pdf-quality extra (torch, GBs of
-                # RAM). Degrade to the tables path rather than failing the call.
-                result = await _in_pdf_worker(extract_pdf, data, pages, "tables")
-                result["metadata"]["quality_fallback"] = "docling not installed; used tables"
-        else:
-            result = await _in_pdf_worker(extract_pdf, data, pages, mode)
+        # The single PDF thread cannot be cancelled, but the caller must not wait on it
+        # forever: past `timeout` the call returns and the thread finishes on its own.
+        # shortcut: a runaway PDF still occupies the worker until it ends; move to a
+        # process pool if that shows up in the logs.
+        async with asyncio.timeout(timeout):
+            if mode == "quality":
+                try:
+                    result = await _in_pdf_worker(extract_pdf_quality, data, pages)  # Docling
+                except ImportError:
+                    # The deployed image leaves out the heavy pdf-quality extra (torch, GBs
+                    # of RAM). Degrade to the tables path rather than failing the call.
+                    result = await _in_pdf_worker(extract_pdf, data, pages, "tables")
+                    result["metadata"]["quality_fallback"] = (
+                        "docling not installed; used tables")
+            else:
+                result = await _in_pdf_worker(extract_pdf, data, pages, mode)
+    except TimeoutError:
+        return err("parse_failed", "PDF extraction timed out", f"{timeout}s",
+                   reason="timeout", retryable=False)
     except ValueError as e:
         # A malformed/out-of-document pages spec on a VALID PDF is caller error, not a
         # corrupt file - don't mislabel it not_pdf.
@@ -532,12 +594,11 @@ async def scrape(
                 timeout=timeout, browser=s.browser, client=s.client, throttle=s.throttle,
             )
     except TimeoutError:
-        return err("fetch_failed", "scrape timed out", f"{timeout}s")
+        return _timeout_err("scrape", timeout)
     except SSRFError as e:
         return _ssrf_err(e, "URL")
     except FetchError as e:
-        code = "blocked_by_antibot" if e.code == "blocked_by_antibot" else "render_failed"
-        return err(code, "render failed", _safe_detail(e))
+        return _fetch_err(e, "render failed", "render_failed")
 
     art = await asyncio.to_thread(extract_article, res["html"], res["final_url"], fmt=format)
     # Raw page HTML must not pass as markdown/text (a blank SPA shell or a challenge page);
@@ -555,7 +616,12 @@ async def scrape(
 
 
 async def batch_read(
-    urls: list[str], concurrency: int = 8, format: _Format = "markdown", clean: bool = True
+    urls: list[str],
+    concurrency: Annotated[int, Field(description="parallel reads, clamped to 1-16")] = 8,
+    format: _Format = "markdown", clean: bool = True,
+    timeout: Annotated[int, Field(description=(
+        "wall clock for the WHOLE batch; URLs still pending at the deadline come back as "
+        "retryable errors with the finished ones"))] = TIMEOUTS["batch_read"],
 ) -> dict:
     """Parallel `read` over many URLs - partial-failure tolerant."""
     if format not in _VALID_FORMATS:
@@ -577,16 +643,27 @@ async def batch_read(
             return {"url": u, "ok": False, "error": r}
         return {"url": u, "ok": True, "content": r["content"], "title": r.get("title")}
 
-    # return_exceptions: an unexpected crash in one read() must not sink the whole batch.
-    raw = await asyncio.gather(*(one(u) for u in urls), return_exceptions=True)
-    results = [
-        r if isinstance(r, dict)
-        else {"url": u, "ok": False,
-              "error": err("fetch_failed", "unexpected read error", _safe_detail(r))}
-        for u, r in zip(urls, raw, strict=True)
-    ]
+    # One deadline for the batch (200 same-host URLs queue a second apart behind the
+    # throttle): finished reads are returned, the rest are flagged, nothing is lost.
+    tasks = [asyncio.ensure_future(one(u)) for u in urls]
+    _done, pending = await asyncio.wait(tasks, timeout=timeout) if tasks else (set(), set())
+    for t in pending:
+        t.cancel()
+    await asyncio.gather(*pending, return_exceptions=True)
+    results = []
+    for u, t in zip(urls, tasks, strict=True):
+        if t in pending:
+            results.append({"url": u, "ok": False,
+                            "error": _timeout_err("batch budget", timeout)})
+        elif t.exception() is not None:  # one read() crashing must not sink the batch
+            results.append({"url": u, "ok": False, "error": err(
+                "fetch_failed", "unexpected read error", _safe_detail(t.exception()))})
+        else:
+            results.append(t.result())
     succeeded = sum(1 for r in results if r["ok"])
     out = {"results": results, "succeeded": succeeded, "failed": len(results) - succeeded}
+    if pending:
+        out["budget_exhausted"] = len(pending)
     if note:
         out["note"] = note
     return out
@@ -611,8 +688,17 @@ async def extract_structured(
 
     single = isinstance(url_or_urls, str)
     urls = [url_or_urls] if single else list(url_or_urls)
+    note = None
+    if len(urls) > BATCH_CAP:  # the loop is sequential: an unbounded list ran for hours
+        note = f"capped to first {BATCH_CAP} of {len(urls)} urls"
+        urls = urls[:BATCH_CAP]
     out = []
+    deadline = time.monotonic() + TIMEOUTS["extract_structured"]
     for u in urls:
+        if time.monotonic() > deadline:
+            budget = TIMEOUTS["extract_structured"]
+            out.append({"url": u, **_timeout_err("extract budget", budget)})
+            continue
         try:
             validate_url(u)
             # selector tier runs on the fetched HTML - no thin-content browser escalation
@@ -624,13 +710,15 @@ async def extract_structured(
             )
             continue
         except FetchError as e:
-            out.append({"url": u, **err("fetch_failed", "fetch failed", _safe_detail(e))})
+            out.append({"url": u, **_fetch_err(e)})
             continue
 
         result = None
         if mode in {"selector", "auto"}:
             try:
-                r = extract_selectors(res["html"], schema)
+                # Client-supplied XPath can be cubic in page size: off the loop, bounded.
+                r = await asyncio.wait_for(
+                    asyncio.to_thread(extract_selectors, res["html"], schema), 15)
                 result = {"url": u, "data": r["data"], "valid": r["valid"], "mode_used": "selector"}
             except Exception as e:  # noqa: BLE001 - never raise to client
                 if mode == "selector":
@@ -662,7 +750,9 @@ async def extract_structured(
             continue
         out.append(result)
 
-    return out[0] if single else {"results": out}
+    if single:
+        return out[0]
+    return {"results": out, **({"note": note} if note else {})}
 
 
 async def crawl(
@@ -704,15 +794,17 @@ async def screenshot(url: str, timeout: int = TIMEOUTS["screenshot"]) -> dict:
     if s.browser is None:
         return err("render_failed", "browser tier unavailable")
     try:
-        res = await fetch(
-            url, render=True, screenshot=True, timeout=timeout,
-            browser=s.browser, client=s.client, throttle=s.throttle,
-        )
+        async with asyncio.timeout(timeout):  # same wall clock as scrape (two renders max)
+            res = await fetch(
+                url, render=True, screenshot=True, timeout=timeout,
+                browser=s.browser, client=s.client, throttle=s.throttle,
+            )
+    except TimeoutError:
+        return _timeout_err("screenshot", timeout)
     except SSRFError as e:
         return _ssrf_err(e, "URL")
     except FetchError as e:
-        code = "blocked_by_antibot" if e.code == "blocked_by_antibot" else "render_failed"
-        return err(code, "screenshot failed", _safe_detail(e))
+        return _fetch_err(e, "screenshot failed", "render_failed")
     return {"url": url, "final_url": res["final_url"], "screenshot": res.get("screenshot"),
             "format": "png"}
 
@@ -790,7 +882,7 @@ async def news_sentiment_feed(
 def _build_auth():
     """Bearer auth from env. Precedence: JWT (prod, rotation/expiry) -> static token -> none.
 
-    - ARGUS_JWT_JWKS_URI (+ optional ARGUS_JWT_ISSUER/ARGUS_JWT_AUDIENCE) -> JWTVerifier.
+    - ARGUS_JWT_JWKS_URI (+ required ARGUS_JWT_ISSUER/ARGUS_JWT_AUDIENCE) -> JWTVerifier.
     - else ARGUS_TOKEN -> StaticTokenVerifier (dev/internal).
     - else None -> no auth (local stdio dev / tests).
     """
@@ -798,11 +890,12 @@ def _build_auth():
     if jwks:
         from fastmcp.server.auth.providers.jwt import JWTVerifier
 
-        return JWTVerifier(
-            jwks_uri=jwks,
-            issuer=os.environ.get("ARGUS_JWT_ISSUER"),
-            audience=os.environ.get("ARGUS_JWT_AUDIENCE"),
-        )
+        issuer = os.environ.get("ARGUS_JWT_ISSUER")
+        audience = os.environ.get("ARGUS_JWT_AUDIENCE")
+        if not (issuer and audience):  # else any token the JWKS ever signed is accepted
+            raise RuntimeError(
+                "ARGUS_JWT_JWKS_URI needs ARGUS_JWT_ISSUER and ARGUS_JWT_AUDIENCE too")
+        return JWTVerifier(jwks_uri=jwks, issuer=issuer, audience=audience)
     token = os.environ.get("ARGUS_TOKEN")
     if not token:
         return None
@@ -823,7 +916,9 @@ def _build_auth():
 
 
 async def research(
-    query: str, mode: Literal["deep", "quick", "answer"] = "deep", max_sources: int = 5,
+    query: str, mode: Literal["deep", "quick", "answer"] = "deep",
+    max_sources: Annotated[int, Field(description=(
+        "sources fully read in deep mode, 1-10 (clamped); each one costs a fetch"))] = 5,
     highlights: bool = False,
     max_chars_per_source: int | None = None, timeout: int = TIMEOUTS["research"],
     ctx: Context | None = None,
@@ -868,17 +963,19 @@ async def research(
     # when requested - the top query-relevant sentence must be reachable even past the cap.
     if isinstance(res, dict):
         want_hl = highlights and semantic.available()
+        hl_deadline = time.monotonic() + _HIGHLIGHTS_BUDGET_S
         for src in res.get("sources", []):
             full = src.pop("_full_content", None)
             if want_hl:
                 text = full or src.get("content")
                 if text:
                     try:
-                        src["highlights"] = await asyncio.to_thread(
-                            semantic.top_sentences, query, text, top_k=3
-                        )
-                    except Exception:  # noqa: BLE001 - a runtime embed failure must not sink
-                        # the whole (successful) bundle; skip highlights and stop retrying.
+                        src["highlights"] = await asyncio.wait_for(asyncio.to_thread(
+                            semantic.top_sentences, query, text, top_k=3,
+                        ), max(1.0, hl_deadline - time.monotonic()))
+                    except Exception:  # noqa: BLE001 - a runtime embed failure (or the
+                        # highlights budget) must not sink the whole (successful) bundle;
+                        # skip highlights and stop retrying.
                         logger.warning("highlights embed failed; returning bundle without them")
                         want_hl = False
 
@@ -941,7 +1038,7 @@ async def find_similar(url_or_text: str, count: int = 10) -> dict:
             except SSRFError as e:
                 return _ssrf_err(e, "URL")
             except FetchError as e:
-                return err("fetch_failed", "fetch failed", _safe_detail(e))
+                return _fetch_err(e)
             art = await asyncio.to_thread(extract_article, res["html"], res["final_url"])
             # The multilingual MiniLM was trained on short paraphrase pairs, so the lead of
             # the article represents the page better than 3000 chars (or, worse, raw HTML).
@@ -975,8 +1072,14 @@ async def find_similar(url_or_text: str, count: int = 10) -> dict:
 
 
 async def github_search(
-    query: str, mode: Literal["repositories", "code", "issues"] = "repositories",
-    language: str | None = None, sort: str | None = None,
+    query: Annotated[str, Field(description=(
+        "GitHub search syntax; qualifiers like user:x, org:x, stars:>100, in:name work; "
+        "do not add the words 'github' or 'repository'"))],
+    mode: Literal["repositories", "code", "issues"] = "repositories",
+    language: str | None = None,
+    sort: Annotated[str | None, Field(description=(
+        "repositories: stars|forks|updated; issues: comments|created|updated; "
+        "code: indexed; default = best match"))] = None,
     order: Literal["desc", "asc"] = "desc", limit: int = 10,
 ) -> dict:
     """Structured GitHub search - mode is exactly `repositories`, `code` or `issues` (not
@@ -1040,6 +1143,10 @@ async def scholar_search(
     return res
 
 
+_GITHUB_SIGNALS = re.compile(r"\b(?:on\s+)?github\b|\brepo(?:sitor(?:y|ies))?\b", re.I)
+_HIGHLIGHTS_BUDGET_S = 20  # research highlights run after the main deadline; bound them too
+
+
 async def smart_search(query: str, count: int = 10) -> dict:
     """Auto-route a query to the best backend (deterministic classifier, no LLM): github /
     scholar / science / news / it / general. Returns {query, route, reason, result}."""
@@ -1049,7 +1156,11 @@ async def smart_search(query: str, count: int = 10) -> dict:
         routed = classify(query)
         r = routed["route"]
         if r == "github":
-            result = await github_search(query, mode="repositories", limit=count)
+            # The words that picked the route ("github", "repository") are not search terms
+            # on GitHub itself: "fastmcp github repository" answered no_results, "fastmcp"
+            # answers. Strip them; keep the query if nothing else is left.
+            gh_query = _GITHUB_SIGNALS.sub(" ", query).strip() or query
+            result = await github_search(gh_query, mode="repositories", limit=count)
         elif r == "scholar":
             result = await scholar_search(query, limit=count)
         elif r == "science":
@@ -1092,6 +1203,11 @@ async def watch(
         validate_url(webhook)
     except SSRFError as e:
         return _ssrf_err(e, "url/webhook")
+    if selector:
+        try:  # a syntax error would otherwise fail every tick, forever, after a restart
+            _select_value("<html><body></body></html>", selector)
+        except Exception as e:  # noqa: BLE001 - cssselect/lxml raise their own types
+            return err("schema_invalid", "invalid CSS/XPath selector", _safe_detail(e))
     try:
         # Each watch is a recurring fetch that survives restarts; cap what a prompt-injected
         # agent can register.
@@ -1142,6 +1258,8 @@ class _MetricsMiddleware(Middleware):
 
     async def on_call_tool(self, context, call_next):
         name = getattr(getattr(context, "message", None), "name", "unknown")
+        if name not in _TOOL_NAMES:  # client-chosen label: bound the metric cardinality
+            name = "unknown"
         _TOOL_CALLS[name] = _TOOL_CALLS.get(name, 0) + 1
 
         # Clamp a client-inflated `timeout` arg to the server ceiling before dispatch.
@@ -1158,6 +1276,13 @@ class _MetricsMiddleware(Middleware):
         t0 = time.perf_counter()
         try:
             result = await call_next(context)
+        except Exception as exc:  # noqa: BLE001 - the contract's last line: never raw
+            # A tool that raised past its own handlers (a sqlite error, a launch failure)
+            # would reach the client as FastMCP's str(exc), unsanitized. Same shape as
+            # every other error, logged in full here.
+            body = err("internal_error", "tool failed", _safe_detail(exc))
+            result = ToolResult(content=[mcp_types.TextContent(
+                type="text", text=json.dumps(body))], structured_content=body)
         finally:
             elapsed = time.perf_counter() - t0
             lat = _tool_latencies.setdefault(name, deque(maxlen=HEALTH_LATENCY_BUCKETS))
@@ -1188,6 +1313,7 @@ TOOLS = (
     watch, list_watches, unwatch,
     forexfactory_calendar, cot_report, news_sentiment_feed,
 )
+_TOOL_NAMES = frozenset(fn.__name__ for fn in TOOLS)
 
 mcp = FastMCP(name="argus", version=__version__, instructions=INSTRUCTIONS, lifespan=lifespan,
               auth=_build_auth(), middleware=[_MetricsMiddleware()])
@@ -1206,10 +1332,15 @@ _ANNOTATIONS = {
 # which would silently truncate the "no truncation" content tools.
 _BIG_RESULT = {"anthropic/maxResultSizeChars": 500_000}
 _BIG = {"read", "scrape", "batch_read", "read_pdf", "research", "crawl"}
+# Claude Code defers MCP tool schemas and loads them through tool search; the three
+# entry points are asked for in nearly every session, so they ship with the server
+# instructions instead of costing a lookup first.
+_ALWAYS = {"read", "search", "research"}
 for _fn in TOOLS:
     _name = _fn.__name__
-    mcp.tool(_fn, annotations=_ANNOTATIONS.get(_name, _READ_WEB),
-             meta=_BIG_RESULT if _name in _BIG else None)
+    _meta = {**(_BIG_RESULT if _name in _BIG else {}),
+             **({"anthropic/alwaysLoad": True} if _name in _ALWAYS else {})}
+    mcp.tool(_fn, annotations=_ANNOTATIONS.get(_name, _READ_WEB), meta=_meta or None)
 
 
 def _healthy() -> bool:
@@ -1396,7 +1527,23 @@ async def metrics(request):
 # ASGI app for `uvicorn argus.server:app` (Streamable HTTP at /mcp). Zero client process.
 # Stateless: no tool keeps per-session state, and in-memory sessions died on every
 # redeploy ("session not found" until the client reconnected).
-app = mcp.http_app(path="/mcp", stateless_http=True)
+# Built on first access (PEP 562) so the HTTP surface can fail CLOSED: with neither
+# ARGUS_TOKEN nor ARGUS_JWT_JWKS_URI set, the container used to come up on 0.0.0.0 with
+# no auth at all after an env slip. stdio (`python -m argus.server`) never touches `app`.
+_app = None
+
+
+def __getattr__(name: str):
+    global _app
+    if name != "app":
+        raise AttributeError(name)
+    if _app is None:
+        if mcp.auth is None and os.environ.get("ARGUS_ALLOW_NOAUTH") != "1":
+            raise RuntimeError(
+                "refusing to serve HTTP without auth: set ARGUS_TOKEN or "
+                "ARGUS_JWT_JWKS_URI, or ARGUS_ALLOW_NOAUTH=1 for a loopback-only stack")
+        _app = mcp.http_app(path="/mcp", stateless_http=True)
+    return _app
 
 
 if __name__ == "__main__":

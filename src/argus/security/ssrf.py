@@ -11,6 +11,7 @@ This is a HARD GATE. Keep it small, pure, and fully covered.
 from __future__ import annotations
 
 import asyncio
+import concurrent.futures
 import ipaddress
 import socket
 from http.cookiejar import DefaultCookiePolicy
@@ -19,7 +20,7 @@ from urllib.parse import urlsplit
 import httpcore
 import httpx
 
-from ..config import DNS_TIMEOUT
+from ..config import DENY_IPS, DNS_TIMEOUT
 
 ALLOWED_SCHEMES = {"http", "https"}
 
@@ -30,8 +31,15 @@ _METADATA_IPS = {"169.254.169.254", "fd00:ec2::254"}
 
 # RFC 6598 Carrier-Grade NAT range - not flagged is_private by ipaddress.
 _CGNAT_V4 = ipaddress.ip_network("100.64.0.0/10")
+# RFC 6052 NAT64 well-known prefix: the low 32 bits name an IPv4 host a translator
+# would dial on our behalf. ipaddress knows mapped/6to4/Teredo, not this one.
+_NAT64_V6 = ipaddress.ip_network("64:ff9b::/96")
 
 _DEFAULT_PORTS = {"http": 80, "https": 443}
+
+# Resolver threads of their own: the default pool is shared with extraction and ONNX
+# work, and under load DNS waited behind them until DNS_TIMEOUT (false dns_failed).
+_DNS_POOL = concurrent.futures.ThreadPoolExecutor(max_workers=8, thread_name_prefix="argus-dns")
 
 
 class SSRFError(Exception):
@@ -57,6 +65,23 @@ def validate_url(url: str) -> None:
         raise SSRFError(f"scheme not allowed: {parts.scheme!r}")
     if not parts.hostname:
         raise SSRFError("missing host")
+    try:
+        _ = parts.port  # urlsplit defers the range check; a port like 99999 raised ValueError
+    except ValueError as exc:  # out of range or non-numeric
+        raise SSRFError("invalid port") from exc
+
+
+def _embedded_v4(addr: ipaddress.IPv6Address) -> ipaddress.IPv4Address | None:
+    """The IPv4 host an IPv6 transition address stands for (mapped, 6to4, Teredo, NAT64)."""
+    if addr.ipv4_mapped is not None:
+        return addr.ipv4_mapped
+    if addr.sixtofour is not None:
+        return addr.sixtofour
+    if addr.teredo is not None:
+        return addr.teredo[1]
+    if addr in _NAT64_V6:
+        return ipaddress.IPv4Address(addr.packed[-4:])
+    return None
 
 
 def is_blocked_ip(ip: str) -> bool:
@@ -64,6 +89,12 @@ def is_blocked_ip(ip: str) -> bool:
     if ip in _METADATA_IPS:
         return True
     addr = ipaddress.ip_address(ip)
+    if str(addr) in DENY_IPS:
+        return True
+    if addr.version == 6:
+        inner = _embedded_v4(addr)
+        if inner is not None and is_blocked_ip(str(inner)):
+            return True
     if (
         addr.is_private
         or addr.is_loopback
@@ -120,7 +151,8 @@ async def aresolve_and_validate(
     for attempt in range(2):
         try:
             async with asyncio.timeout(timeout):
-                return await asyncio.to_thread(resolve_and_validate, host, port)
+                return await asyncio.get_running_loop().run_in_executor(
+                    _DNS_POOL, resolve_and_validate, host, port)
         except TimeoutError as exc:
             raise DNSError(f"resolution timed out for {host!r} after {timeout:g}s") from exc
         except DNSError as exc:

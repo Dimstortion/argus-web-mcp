@@ -1,3 +1,5 @@
+import asyncio
+
 import pytest
 
 from argus import server
@@ -19,6 +21,83 @@ async def test_read_ssrf_blocked_returns_error_not_raise(app_state):
     r = await server.read("http://169.254.169.254/latest/meta-data/")
     assert r["code"] == "ssrf_blocked"
     assert "error" in r
+    assert r["retryable"] is False
+
+
+async def test_read_fetch_errors_are_actionable(app_state, monkeypatch):
+    """A 500, a timeout and an anti-bot wall used to all be {fetch_failed, 'FetchError'}."""
+    from argus.fetch.static import FetchError
+
+    cases = {
+        "http://fixtures.test/500": FetchError("fetch_failed", "status 500", status=500),
+        "http://fixtures.test/slow": FetchError("fetch_failed", "ReadTimeout"),
+        "http://fixtures.test/wall": FetchError("blocked_by_antibot", "status 403", status=403),
+    }
+    cases["http://fixtures.test/slow"].__cause__ = TimeoutError()
+
+    async def failing(url, **kw):
+        raise cases[url]
+
+    monkeypatch.setattr(server, "fetch", failing)
+    r500 = await server.read("http://fixtures.test/500")
+    assert (r500["code"], r500["http_status"], r500["reason"], r500["retryable"]) == (
+        "fetch_failed", 500, "http_500", True)
+    assert r500["detail"] == "FetchError"  # sanitized detail is unchanged
+    slow = await server.read("http://fixtures.test/slow")
+    assert (slow["reason"], slow["retryable"], slow["http_status"]) == ("timeout", True, None)
+    wall = await server.read("http://fixtures.test/wall")
+    assert (wall["code"], wall["http_status"], wall["retryable"]) == (
+        "blocked_by_antibot", 403, False)
+    # batch_read carries the same shape per URL
+    b = await server.batch_read(["http://fixtures.test/500"])
+    assert b["results"][0]["error"]["http_status"] == 500
+
+
+async def test_read_serves_stale_copy_flagged(app_state, monkeypatch):
+    """An expired cache row served because the live fetch failed says so (stale +
+    cached_at) instead of looking like a fresh read."""
+    from argus.fetch.static import FetchError
+
+    fresh = await server.read(f"{BASE}/article")
+    assert fresh["from_cache"] is False and "stale" not in fresh
+
+    async def failing(url, **kw):
+        raise FetchError("fetch_failed", "down")
+
+    monkeypatch.setattr(server, "fetch", failing)
+    import argus.cache as cache_mod
+
+    real = cache_mod.time.time()
+    monkeypatch.setattr(cache_mod.time, "time", lambda: real + 10**6)  # past the TTL
+    r = await server.read(f"{BASE}/article")
+    assert r["from_cache"] is True and r["stale"] is True
+    assert r["cached_at"] <= real
+    assert r["content"] == fresh["content"]
+
+
+async def test_read_has_a_hard_ceiling(app_state, monkeypatch):
+    async def hangs(url, **kw):
+        await asyncio.sleep(30)
+
+    monkeypatch.setattr(server, "fetch", hangs)
+    monkeypatch.setattr(server, "_READ_GRACE_S", 0)
+    r = await server.read(f"{BASE}/article", timeout=1)
+    assert r["code"] == "fetch_failed" and r["reason"] == "timeout" and r["retryable"]
+
+
+async def test_read_does_not_cache_a_wayback_copy(app_state, monkeypatch):
+    calls = {"n": 0}
+
+    async def archived(url, **kw):
+        calls["n"] += 1
+        return {"final_url": url, "status": 200, "render_path": "archive",
+                "html": "<html><body><article>" + "snap " * 80 + "</article></body></html>"}
+
+    monkeypatch.setattr(server, "fetch", archived)
+    r1 = await server.read(f"{BASE}/flaky")
+    assert r1["render_path"] == "archive"
+    r2 = await server.read(f"{BASE}/flaky")
+    assert r2["from_cache"] is False and calls["n"] == 2
 
 
 async def test_read_bad_scheme(app_state):
@@ -126,6 +205,53 @@ async def test_batch_read_cap_note(app_state):
     assert len(r["results"]) == 200
 
 
+async def test_batch_read_deadline_returns_finished_and_flags_the_rest(app_state, monkeypatch):
+    """One wall clock for the batch: finished reads come back, pending ones are flagged
+    as retryable errors, and the call never outlives TIMEOUTS['batch_read']."""
+    real_read = server.read
+
+    async def slow_read(u, **kw):
+        if u.endswith("/slow"):
+            await asyncio.sleep(30)
+        return await real_read(u, **kw)
+
+    monkeypatch.setattr(server, "read", slow_read)
+    r = await server.batch_read([f"{BASE}/article", f"{BASE}/slow"], timeout=1)
+    assert r["succeeded"] == 1 and r["failed"] == 1 and r["budget_exhausted"] == 1
+    assert r["results"][1]["error"]["reason"] == "timeout"
+    assert r["results"][1]["error"]["retryable"] is True
+    assert (await server.batch_read([]))["results"] == []
+
+
+async def test_extract_structured_caps_the_url_list(app_state):
+    r = await server.extract_structured([f"{BASE}/struct"] * 205, {"title": "h1"})
+    assert len(r["results"]) == 200 and "note" in r
+
+
+async def test_read_pdf_extraction_has_a_deadline(app_state, monkeypatch):
+    async def stuck(fn, *args):
+        await asyncio.sleep(30)
+
+    monkeypatch.setattr(server, "_in_pdf_worker", stuck)
+    r = await server.read_pdf(f"{BASE}/doc.pdf", timeout=1)
+    assert r["code"] == "parse_failed" and r["reason"] == "timeout"
+
+
+async def test_screenshot_has_a_deadline(app_state, monkeypatch):
+    async def hangs(url, **kw):
+        await asyncio.sleep(30)
+
+    monkeypatch.setattr(server, "fetch", hangs)
+    r = await server.screenshot(f"{BASE}/article", timeout=1)
+    assert r["code"] == "fetch_failed" and r["reason"] == "timeout"
+
+
+async def test_watch_rejects_a_broken_selector(app_state):
+    r = await server.watch(f"{BASE}/article", "https://hook.test/in", selector="h1[")
+    assert r["code"] == "schema_invalid"
+    assert (await server.list_watches())["count"] == 0
+
+
 async def test_extract_structured_selector(app_state):
     schema = {
         "title": "h1",
@@ -174,6 +300,26 @@ async def test_search_cached(app_state, monkeypatch):
     r2 = await server.search("gold price")
     assert r2["from_cache"] is True
     assert calls["n"] == 1  # second served from cache
+
+
+async def test_search_count_is_clamped_and_list_queries_cache_apart(app_state, monkeypatch):
+    seen = []
+
+    async def fake_search(query, **kw):
+        seen.append((query, kw["count"]))
+        return {"query": query, "results": [{"title": "T", "url": "http://x/1", "snippet": "s",
+                                             "engine": "duck"}], "count": 1, "engines_used": []}
+
+    monkeypatch.setattr(server, "searxng_search", fake_search)
+    await server.search("gold price", count=100000)
+    assert seen[-1][1] == 100
+    await server.search("gold price", count=0)
+    assert seen[-1][1] == 1
+    # ["gold", "price"] fans out as two RRF-merged searches; "gold price" is one query:
+    # they must not share a cache row (the old key joined the list with a space).
+    await server.search(["gold", "price"])
+    await server.search("gold price")
+    assert [q for q, _ in seen[-2:]] == [["gold", "price"], "gold price"]
 
 
 async def test_search_backend_down(app_state, monkeypatch):
@@ -283,10 +429,70 @@ async def test_research_highlights(app_state, monkeypatch):
 
 def test_auth_jwt_precedence(monkeypatch):
     monkeypatch.setenv("ARGUS_JWT_JWKS_URI", "https://issuer.example/.well-known/jwks.json")
+    monkeypatch.setenv("ARGUS_JWT_ISSUER", "https://issuer.example")
+    monkeypatch.setenv("ARGUS_JWT_AUDIENCE", "argus")
     monkeypatch.setenv("ARGUS_TOKEN", "ignored-when-jwt-set")
     auth = server._build_auth()
     assert auth is not None
     assert type(auth).__name__ == "JWTVerifier"
+
+
+def test_auth_jwt_requires_issuer_and_audience(monkeypatch):
+    """Without them any token the JWKS ever signed is accepted: refuse to start."""
+    monkeypatch.setenv("ARGUS_JWT_JWKS_URI", "https://issuer.example/.well-known/jwks.json")
+    monkeypatch.delenv("ARGUS_JWT_ISSUER", raising=False)
+    monkeypatch.delenv("ARGUS_JWT_AUDIENCE", raising=False)
+    with pytest.raises(RuntimeError):
+        server._build_auth()
+
+
+def test_http_app_fails_closed_without_auth(monkeypatch):
+    """`uvicorn argus.server:app` must not come up on 0.0.0.0 with no bearer after an env
+    slip; the loopback-only local overlay opts out with ARGUS_ALLOW_NOAUTH=1."""
+    monkeypatch.setattr(server, "_app", None)
+    monkeypatch.delenv("ARGUS_ALLOW_NOAUTH", raising=False)
+    assert server.mcp.auth is None  # the test process has no ARGUS_TOKEN
+    with pytest.raises(RuntimeError):
+        server.__getattr__("app")
+    monkeypatch.setenv("ARGUS_ALLOW_NOAUTH", "1")
+    app = server.__getattr__("app")
+    assert app is server.__getattr__("app")  # built once
+    monkeypatch.setattr(server, "_app", None)
+
+
+async def test_middleware_turns_an_unhandled_exception_into_internal_error():
+    """The contract's last line: a tool raising past its own handlers reaches the client
+    as a structured error (sanitized), never as FastMCP's raw str(exc)."""
+    server._TOOL_CALLS.clear()
+    mw = server._MetricsMiddleware()
+
+    class _Ctx:
+        class message:
+            name = "read"
+
+    async def _next(_c):
+        raise RuntimeError("sqlite went away: /home/argus/.argus/cache.db")
+
+    out = await mw.on_call_tool(_Ctx(), _next)
+    assert out.is_error is True
+    assert out.structured_content["code"] == "internal_error"
+    assert "cache.db" not in out.structured_content["detail"]  # class name only
+    assert server._TOOL_CALLS["read"] == 1
+
+
+async def test_metrics_middleware_bounds_label_cardinality():
+    server._TOOL_CALLS.clear()
+    mw = server._MetricsMiddleware()
+
+    class _Ctx:
+        class message:
+            name = 'not_a_tool"\n'
+
+    async def _next(_c):
+        return {"ok": True}
+
+    await mw.on_call_tool(_Ctx(), _next)
+    assert set(server._TOOL_CALLS) == {"unknown"}
 
 
 async def test_metrics_middleware_counts():
@@ -861,6 +1067,8 @@ async def test_smart_search_routes(app_state, monkeypatch):
 
     r1 = await server.smart_search("fastmcp github repository")
     assert r1["route"] == "github" and "result" in r1
+    # the routing words are not search terms on GitHub: they are stripped from the query
+    assert r1["result"]["query"] == "fastmcp"
     r2 = await server.smart_search("transformer attention paper arxiv")
     assert r2["route"] == "scholar"
     r3 = await server.smart_search("P versus NP problem explained simply")

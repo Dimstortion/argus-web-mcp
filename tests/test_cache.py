@@ -71,11 +71,24 @@ def test_get_stale_returns_expired_payload(cache, monkeypatch):
     real = cache_mod.time.time()
     monkeypatch.setattr(cache_mod.time, "time", lambda: real + 10**9)
     assert cache.get(k, ttl_seconds=600) is None
-    assert cache.get_stale(k) == {"content": "stale-ok"}
+    stale = cache.get_stale(k)
+    assert stale["content"] == "stale-ok"
+    assert real - 5 <= stale["cached_at"] <= real  # write time: a stale-serve states its age
 
 
 def test_get_stale_missing_returns_none(cache):
     assert cache.get_stale("nope") is None
+
+
+def test_corrupt_gzip_blob_self_heals(cache):
+    """A gzip header followed by a corrupt deflate stream raises zlib.error, which is neither
+    OSError nor ValueError: every read of that key used to raise into the tool."""
+    k = cache.key("https://big.example", {})
+    cache.put(k, {"content": "x" * 40_000}, source="read")  # past the inline limit -> blob
+    (cache.blob_dir / k).write_bytes(b"\x1f\x8b\x08\x00" + b"\x00" * 6 + b"\xff\xff\xff\xff")
+    assert cache.get(k, ttl_seconds=600) is None
+    assert cache.get_stale(k) is None
+    assert not (cache.blob_dir / k).exists()
 
 
 # 4. large payload via blob, small inline
@@ -188,7 +201,7 @@ def test_purge_removes_old_rows_and_blobs(cache, monkeypatch):
     assert cache.get_stale(old_inline) is None
     assert cache.get_stale(old_blob) is None
     assert not blob_file.exists()
-    assert cache.get_stale(fresh) == {"content": "z"}
+    assert cache.get_stale(fresh)["content"] == "z"
 
 
 def test_purge_removes_orphaned_blob_files(cache, monkeypatch):
@@ -205,7 +218,7 @@ def test_purge_removes_orphaned_blob_files(cache, monkeypatch):
     os.utime(blob_file, (real - 8 * 86400, real - 8 * 86400))
     cache.purge()
     assert not blob_file.exists()
-    assert cache.get_stale(k) == {"content": "small"}  # live inline row untouched
+    assert cache.get_stale(k)["content"] == "small"  # live inline row untouched
 
 
 def test_purge_leaves_fresh_blob_files(cache):
@@ -216,7 +229,7 @@ def test_purge_leaves_fresh_blob_files(cache):
     assert blob.exists()
     assert cache.purge() == 0
     assert blob.exists()
-    assert cache.get_stale(k) == {"content": "y" * 40000}
+    assert cache.get_stale(k)["content"] == "y" * 40000
 
 
 # 7. blob compression (0.4.7): blobs are gzip on disk; legacy plain blobs still read.

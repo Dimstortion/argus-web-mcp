@@ -17,6 +17,7 @@ block on the seed propagates as ``SSRFError`` before any discovery work happens.
 
 from __future__ import annotations
 
+import asyncio
 import gzip
 import io
 import re
@@ -27,7 +28,6 @@ import httpx
 
 from .fetch.static import (
     _DEFAULT_PORTS,
-    MAX_FETCH_BYTES,
     FetchError,
     _get_guarded,
     fetch_static,
@@ -112,13 +112,19 @@ def _robots_sitemaps(robots: str, base: str) -> list[str]:
     return out
 
 
+# ElementTree expands a sitemap several-fold in memory (a 30 MB file of tiny <url>
+# entries reaches GBs against a 3 GB container); 8 MiB holds ~50k URLs, the format's own
+# per-file limit, and far more than max_urls (<= 5000) can use.
+_MAX_SITEMAP_BYTES = 8 * 1024 * 1024
+
+
 async def _get_sitemap_xml(url: str, *, client: httpx.AsyncClient, timeout: int) -> str | None:
     """Fetch a sitemap as XML text, transparently un-gzipping ``.xml.gz`` payloads.
 
     Sniffs the gzip magic (not the URL suffix): httpx already un-gzips
     Content-Encoding responses, so a ``.gz`` URL may arrive as plain XML, and a plain
     URL may serve a raw gzip file. The DECOMPRESSED size is hard-capped at
-    ``MAX_FETCH_BYTES`` (zip-bomb guard). Returns None on any fetch/decompress failure.
+    ``_MAX_SITEMAP_BYTES`` (zip-bomb guard). Returns None on any fetch/decompress failure.
     """
     try:
         resp, data = await _get_guarded(url, client=client, timeout=timeout, max_redirects=5)
@@ -128,12 +134,12 @@ async def _get_sitemap_xml(url: str, *, client: httpx.AsyncClient, timeout: int)
         return None
     if data[:2] == b"\x1f\x8b":
         try:
-            raw = gzip.GzipFile(fileobj=io.BytesIO(data)).read(MAX_FETCH_BYTES + 1)
+            raw = gzip.GzipFile(fileobj=io.BytesIO(data)).read(_MAX_SITEMAP_BYTES + 1)
         except (OSError, EOFError):
             return None
-        if len(raw) > MAX_FETCH_BYTES:
-            return None
         data = raw
+    if len(data) > _MAX_SITEMAP_BYTES:
+        return None
     return data.decode("utf-8", "replace")
 
 
@@ -149,8 +155,8 @@ async def _collect_from_sitemaps(
         xml = await _get_sitemap_xml(sm, client=client, timeout=timeout)
         if xml is None:
             continue
-        try:
-            page_locs, child_sitemaps = _parse_sitemap(xml)
+        try:  # off the loop: parsing 8 MiB of XML is ~1 s of CPU
+            page_locs, child_sitemaps = await asyncio.to_thread(_parse_sitemap, xml)
         except ET.ParseError:
             continue
         locs.extend(page_locs)

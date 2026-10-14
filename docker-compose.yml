@@ -72,6 +72,13 @@ services:
       # Empty ARGUS_EGRESS_PROXY turns it off; empty HOSTS = the default list in config.py.
       - ARGUS_EGRESS_PROXY=${ARGUS_EGRESS_PROXY-http://warp:9091}
       - ARGUS_EGRESS_PROXY_HOSTS=${ARGUS_EGRESS_PROXY_HOSTS:-}
+      # The SSRF gate denies private ranges; the box's OWN public IP is not one, yet from
+      # the container it reaches the host's sshd (measured 2026-10-04). Operator deny-list,
+      # comma-separated; the default is the SURIOTA VPS. Harmless on any other host.
+      - ARGUS_DENY_IPS=${ARGUS_DENY_IPS:-43.134.17.144}
+      # HTTP refuses to start without ARGUS_TOKEN/ARGUS_JWT_JWKS_URI unless this is 1.
+      # Only the loopback-only local overlay sets it; the Easypanel deploy must not.
+      - ARGUS_ALLOW_NOAUTH=${ARGUS_ALLOW_NOAUTH:-}
     shm_size: 1gb               # Chromium crashes on the default 64m
     # The box (7 GB) is shared with other stacks: past this Argus is OOM-killed and
     # restarted, instead of the host OOM killer picking a neighbour.

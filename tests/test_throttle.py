@@ -122,6 +122,20 @@ async def test_breaker_half_opens_after_cooldown(throttle: HostThrottle, clock: 
 
 
 @pytest.mark.asyncio
+async def test_half_open_admits_exactly_one_trial(throttle: HostThrottle, clock: FakeClock):
+    """Clearing the open flag at half-open let a whole burst through before the trial's
+    verdict; the breaker re-arms, so the second caller is refused until record_success."""
+    for _ in range(5):
+        throttle.record_failure("down.com")
+    clock.advance(61.0)
+    await throttle.acquire("down.com")  # the trial
+    with pytest.raises(CircuitOpen):
+        await throttle.acquire("down.com")  # the burst behind it
+    throttle.record_success("down.com")
+    await throttle.acquire("down.com")  # closed again
+
+
+@pytest.mark.asyncio
 async def test_open_breaker_within_cooldown_still_blocks(throttle: HostThrottle, clock: FakeClock):
     for _ in range(5):
         throttle.record_failure("down.com")

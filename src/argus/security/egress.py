@@ -144,6 +144,12 @@ async def guarded_browser_config(**kwargs):
 
     return BrowserConfig(
         proxy_config={"server": await proxy_url()},
-        extra_args=["--proxy-bypass-list=<-loopback>"],
+        extra_args=[
+            "--proxy-bypass-list=<-loopback>",
+            # WebRTC is UDP and never goes through an HTTP proxy: page JS could STUN
+            # straight at private ranges and learn the box's real IP. Proxied-only UDP.
+            "--webrtc-ip-handling-policy=disable_non_proxied_udp",
+            "--force-webrtc-ip-handling-policy",
+        ],
         **kwargs,
     )

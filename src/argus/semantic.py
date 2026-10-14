@@ -35,6 +35,9 @@ _EMBED_BATCH = 8
 
 _EMBEDDER = None  # lazily-created TextEmbedding singleton
 _EMBEDDER_LOCK = threading.Lock()  # guards the lazy init against concurrent first-calls
+# One ONNX session.run at a time: each concurrent run allocates its own arena scratch (the
+# +263 MB above is PER run) and oversubscribes the 2 vCPU; serialised is no slower.
+_EMBED_LOCK = threading.Lock()
 
 
 class SemanticUnavailable(Exception):
@@ -83,7 +86,8 @@ def embed(texts: list[str]) -> list[list[float]]:
     """Embed texts with the singleton model. Empty input -> []. Raises SemanticUnavailable."""
     if not texts:
         return []
-    vectors = _get_embedder().embed(texts, batch_size=_EMBED_BATCH)
+    with _EMBED_LOCK:  # embed() is a generator: consume it inside the lock
+        vectors = list(_get_embedder().embed(texts, batch_size=_EMBED_BATCH))
     return [np.asarray(vec, dtype=np.float64).tolist() for vec in vectors]
 
 

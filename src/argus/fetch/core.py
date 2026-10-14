@@ -8,7 +8,6 @@ twice. SSRF is enforced in the static hop guard and the browser pre-check.
 from __future__ import annotations
 
 import logging
-import re
 import time
 from urllib.parse import urlsplit
 
@@ -17,7 +16,7 @@ from ..security.ssrf import SSRFError
 from .adapters import fetch_stackexchange, stackexchange_target
 from .fallback import fetch_via_archive
 from .render import BrowserPool
-from .static import FetchError, _guard, fetch_static
+from .static import FetchError, _guard, fetch_static, visible_text_len
 
 logger = logging.getLogger("argus.fetch")
 
@@ -55,14 +54,8 @@ def _remember_failure(url: str, exc: FetchError) -> None:
         del _negative[next(iter(_negative))]  # oldest insert first
     _negative[url] = (time.monotonic() + NEGATIVE_TTL, exc.code, str(exc))
 
-_SCRIPT_STYLE = re.compile(r"<(script|style)[^>]*>.*?</\1>", re.IGNORECASE | re.DOTALL)
-_TAGS = re.compile(r"<[^>]+>")
 
-
-def _visible_text_len(html: str) -> int:
-    """Char count of visible text (scripts/styles/tags removed) - JS-shell detector."""
-    stripped = _SCRIPT_STYLE.sub(" ", html)
-    return len(" ".join(_TAGS.sub(" ", stripped).split()))
+_visible_text_len = visible_text_len  # JS-shell detector; linear lxml form (static.py)
 
 
 async def fetch(url: str, *, throttle=None, **kwargs) -> dict:

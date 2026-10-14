@@ -26,6 +26,7 @@ Design notes
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import json
 import logging
@@ -35,6 +36,7 @@ from collections.abc import Awaitable, Callable
 from dataclasses import asdict, dataclass, fields
 from pathlib import Path
 from typing import Any, Protocol
+from urllib.parse import urlsplit
 
 from parsel import Selector
 
@@ -44,6 +46,15 @@ logger = logging.getLogger("argus.watch")
 
 # fetch result keys that may hold the page content, most-specific first.
 _CONTENT_KEYS = ("content", "markdown", "html", "text")
+# A client-supplied XPath can be cubic in page size; the parse runs off the loop and is
+# abandoned past this (the thread finishes on its own; the poller stays responsive).
+_SELECT_BUDGET_S = 15
+
+
+def _host_only(url: str) -> str:
+    """Webhook URLs carry secrets (Telegram bot tokens): log scheme://host only."""
+    p = urlsplit(url)
+    return f"{p.scheme}://{p.hostname or ''}"
 
 FetchFn = Callable[[str], Awaitable[dict]]
 
@@ -110,11 +121,13 @@ class WatchStore:
             return []
         try:
             rows = json.loads(self._path.read_text(encoding="utf-8"))
-        except (json.JSONDecodeError, OSError):
+            allowed = {f.name for f in fields(Watch)}
+            return [Watch(**{k: v for k, v in row.items() if k in allowed}) for row in rows]
+        except (json.JSONDecodeError, OSError, TypeError, AttributeError):
+            # TypeError/AttributeError: a row missing a required field or not a dict - a
+            # damaged file must not keep the server from starting.
             logger.warning("watch store unreadable, starting empty: %s", self._path)
             return []
-        allowed = {f.name for f in fields(Watch)}
-        return [Watch(**{k: v for k, v in row.items() if k in allowed}) for row in rows]
 
     def _persist(self) -> None:
         self._path.parent.mkdir(parents=True, exist_ok=True)
@@ -180,12 +193,22 @@ async def check_watch(w: Watch, *, fetch_fn: FetchFn, now: float) -> dict:
     Returns ``{changed, new_hash, value}``. ``changed`` is True only when a prior
     hash exists and differs (first-ever check establishes the baseline ->
     ``changed=False``). Never raises on fetch/extract error -> ``{changed: False,
-    error: ...}``.
+    error: ...}``. A selector that matches nothing is ``error: selector_not_found``
+    (the previous hash is kept; hashing the whole page instead fired a change event on
+    every ad rotation), and a Wayback copy is ``error: archive_only`` (not the live page).
     """
     try:
         fetched = await fetch_fn(w.url)
+        if fetched.get("render_path") == "archive":
+            return {"changed": False, "error": "archive_only"}
         content = _content_of(fetched)
-        value = _select_value(content, w.selector) if w.selector else None
+        value = None
+        if w.selector:
+            value = await asyncio.wait_for(
+                asyncio.to_thread(_select_value, content, w.selector), _SELECT_BUDGET_S
+            )
+            if value is None:
+                return {"changed": False, "error": "selector_not_found"}
         new_hash = content_signature(content, value)
     except Exception as exc:  # noqa: BLE001 - watch must never crash the poller
         logger.warning("watch %s check failed: %s", w.id, exc)
@@ -203,20 +226,20 @@ async def deliver(webhook: str, payload: dict, *, client: _HttpClient) -> bool:
     """
     try:
         validate_url(webhook)
-        from urllib.parse import urlsplit
-
         parts = urlsplit(webhook)
         port = parts.port or (443 if parts.scheme == "https" else 80)
         await aresolve_and_validate(parts.hostname, port)
     except SSRFError as exc:
-        logger.warning("webhook blocked by SSRF guard, not delivering: %s (%s)", webhook, exc)
+        logger.warning("webhook blocked by SSRF guard, not delivering: %s (%s)",
+                       _host_only(webhook), exc)
         return False
 
     try:
         resp = await client.post(webhook, json=payload)
         return 200 <= resp.status_code < 300
     except Exception as exc:  # noqa: BLE001 - delivery failure is non-fatal
-        logger.warning("webhook delivery failed: %s (%s)", webhook, exc)
+        logger.warning("webhook delivery failed: %s (%s)", _host_only(webhook),
+                       type(exc).__name__)
         return False
 
 
@@ -251,7 +274,10 @@ async def poll_due(
                 "new_hash": res["new_hash"],
                 "checked_at": now,
             }
-            delivered = await deliver(w.webhook, payload, client=client)
+            try:
+                delivered = await deliver(w.webhook, payload, client=client)
+            except Exception as exc:  # noqa: BLE001 - one webhook must not stall the others
+                logger.warning("watch %s delivery crashed: %s", w.id, type(exc).__name__)
 
         try:
             store.update_state(w.id, res.get("new_hash", w.last_hash), now)

@@ -7,3 +7,6 @@ services:
   argus:
     ports:
       - "127.0.0.1:8090:8090"   # loopback only - never expose this
+    environment:
+      # The HTTP app fails closed without a token (0.4.28); loopback-only needs none.
+      - ARGUS_ALLOW_NOAUTH=1

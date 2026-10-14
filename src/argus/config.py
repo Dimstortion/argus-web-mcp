@@ -7,6 +7,7 @@ No YAML file needed; 12-factor app style.
 from __future__ import annotations
 
 import concurrent.futures
+import ipaddress
 import logging
 import os
 from urllib.parse import urlsplit
@@ -88,6 +89,25 @@ def _valid_proxy(url: str) -> bool:
     return (u.scheme == "http" and bool(u.hostname) and "@" not in u.netloc
             and (port is None or port > 0))
 
+
+def _parse_deny_ips(raw: str) -> frozenset[str]:
+    """Operator deny-list for the SSRF gate (``ARGUS_DENY_IPS``, comma-separated): the
+    box's own public IP belongs here, since it is not a private range yet reaches the
+    host's sshd/panel. Normalised so ``is_blocked_ip`` can compare canonical strings."""
+    out: set[str] = set()
+    for tok in raw.split(","):
+        tok = tok.strip()
+        if not tok:
+            continue
+        try:
+            out.add(str(ipaddress.ip_address(tok)))
+        except ValueError:
+            logging.getLogger("argus.config").warning(
+                "ARGUS_DENY_IPS: ignoring %r (not an IP address)", tok)
+    return frozenset(out)
+
+
+DENY_IPS = _parse_deny_ips(os.environ.get("ARGUS_DENY_IPS", ""))
 
 EGRESS_PROXY = os.environ.get("ARGUS_EGRESS_PROXY", "").strip()
 if EGRESS_PROXY and not _valid_proxy(EGRESS_PROXY):

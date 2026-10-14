@@ -64,8 +64,10 @@ class HostThrottle:
         if st.opened_at is not None:
             if now - st.opened_at < self._cooldown:
                 raise CircuitOpen(f"breaker open for {host}")
-            # Cooldown elapsed -> half-open: clear the open flag, allow one trial through.
-            st.opened_at = None
+            # Cooldown elapsed -> half-open: exactly one trial goes through. Re-arming the
+            # open time keeps the burst behind it out until record_success closes the
+            # breaker (clearing the flag here let every concurrent caller through).
+            st.opened_at = now
 
         # Reserve the slot BEFORE awaiting: N concurrent same-host acquirers each take the
         # next free slot (read+write with no await between = race-free on the single loop),

@@ -318,6 +318,97 @@ def test_visible_text_len_ignores_scripts():
     assert _visible_text_len(ARTICLE) >= 80
 
 
+def test_visible_text_len_is_linear_on_hostile_markup():
+    """100 KB of '<' took 11 s with the old regex (quadratic, on the event loop)."""
+    import time
+
+    for hostile in ("<" * 100_000, "<script>" * 20_000, "<script>" + "x" * 150_000):
+        t0 = time.perf_counter()
+        _visible_text_len(hostile)
+        assert time.perf_counter() - t0 < 1.0
+    assert _visible_text_len("<html><body>\x00ctrl</body></html>") >= 0  # lxml ValueError path
+
+
+async def test_brotli_body_is_refused_and_never_requested(monkeypatch):
+    """httpx inflates each raw chunk before the streaming cap sees it, and brotli packs
+    200 MB of zeros into 329 bytes. We ask for gzip/deflate only and refuse anything else."""
+    monkeypatch.setattr(socket, "getaddrinfo", _gai({}))
+    seen = {}
+
+    def h(req):
+        seen["accept"] = req.headers["accept-encoding"]
+        return httpx.Response(200, content=b"\x0b\x02\x80ok\x03",
+                              headers={"content-encoding": "br"})
+
+    async with _client(h) as c:
+        with pytest.raises(FetchError) as ei:
+            await fetch_static("http://example.com/", client=c)
+    assert "content-encoding" in str(ei.value)
+    assert seen["accept"] == "gzip, deflate"
+
+
+async def test_slow_drip_body_hits_the_hop_deadline(monkeypatch):
+    """httpx timeouts are per socket read; a body trickling one chunk per second passes
+    them forever. The whole body read now gets the hop timeout as a wall clock."""
+    monkeypatch.setattr(socket, "getaddrinfo", _gai({}))
+
+    def h(req):
+        async def body():
+            for _ in range(50):
+                yield b"x"
+                await asyncio.sleep(0.05)
+
+        return httpx.Response(200, content=body())
+
+    async with _client(h) as c:
+        with pytest.raises(FetchError) as ei:
+            await fetch_static("http://example.com/drip", client=c, timeout=0.2)
+    assert "body read exceeded" in str(ei.value)
+
+
+async def test_unparseable_redirect_location_is_a_fetch_error(monkeypatch):
+    """A hostile Location (port out of range) raised ValueError straight to the client."""
+    monkeypatch.setattr(socket, "getaddrinfo", _gai({}))
+
+    def h(req):
+        return httpx.Response(302, headers={"location": "http://example.com:99999/x"})
+
+    async with _client(h) as c:
+        with pytest.raises((FetchError, SSRFError)):
+            await fetch_static("http://example.com/", client=c)
+
+
+@pytest.mark.parametrize("headers", [{"cf-mitigated": "challenge"},
+                                     {"x-amzn-waf-action": "challenge"}])
+async def test_2xx_challenge_headers_are_an_antibot_block(monkeypatch, headers):
+    monkeypatch.setattr(socket, "getaddrinfo", _gai({}))
+
+    def h(req):
+        return httpx.Response(202, headers=headers, text="")
+
+    async with _client(h) as c:
+        with pytest.raises(FetchError) as ei:
+            await fetch_static("https://wall.test/", client=c)
+    assert (ei.value.code, ei.value.status) == ("blocked_by_antibot", 202)
+
+
+async def test_200_interstitial_body_is_an_antibot_block(monkeypatch):
+    """A 200 'Just a moment...' used to be returned (and cached) as page content."""
+    monkeypatch.setattr(socket, "getaddrinfo", _gai({}))
+
+    def h(req):
+        if req.url.host == "wall.test":
+            return httpx.Response(200, text="<html><head><title>Just a moment...</title>"
+                                            "</head><body>Checking your browser</body></html>")
+        return httpx.Response(200, text=ARTICLE)
+
+    async with _client(h) as c:
+        with pytest.raises(FetchError) as ei:
+            await fetch_static("https://wall.test/", client=c)
+        assert ei.value.code == "blocked_by_antibot"
+        assert (await fetch_static("https://fine.test/", client=c))["status"] == 200
+
+
 # --- egress fallback: static transport failure recovery ---------------------
 
 SNAPSHOT_URL = "http://web.archive.org/web/20240101000000/http://blocked.example/"

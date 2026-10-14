@@ -36,6 +36,8 @@ from argus.security.ssrf import (
         "gopher://x",
         "http://",  # no host
         "https:///path",  # no host
+        "http://example.com:99999/",  # port out of range: urlsplit().port raised ValueError
+        "http://example.com:abc/",  # non-numeric port
     ],
 )
 def test_validate_url_rejects(url):
@@ -80,6 +82,12 @@ BLOCKED_IPS = [
     "224.0.0.1",  # multicast v4
     "100.64.0.1",  # CGNAT low edge
     "100.127.255.255",  # CGNAT high edge
+    # IPv6 transition forms that stand for a private IPv4 host (unwrapped and re-checked).
+    "::ffff:10.0.0.1",  # IPv4-mapped
+    "2002:0a00:0001::",  # 6to4 for 10.0.0.1
+    "2001:0:4136:e378:8000:63bf:f5ff:fffe",  # Teredo, client 10.0.0.1 (inverted)
+    "64:ff9b::a00:1",  # NAT64 for 10.0.0.1
+    "64:ff9b::a9fe:a9fe",  # NAT64 for 169.254.169.254 (metadata)
 ]
 
 ALLOWED_IPS = [
@@ -100,6 +108,32 @@ def test_is_blocked_ip_blocks(ip):
 @pytest.mark.parametrize("ip", ALLOWED_IPS)
 def test_is_blocked_ip_allows(ip):
     assert is_blocked_ip(ip) is False
+
+
+def test_is_blocked_ip_allows_mapped_form_of_a_public_host():
+    """::ffff:8.8.8.8 embeds a public host, so the unwrap does not block it (6to4 and NAT64
+    spellings of public hosts are refused anyway: 2002::/16 is private and 64:ff9b::/96
+    sits in the reserved ::/8 block, so only the mapped form reaches this branch)."""
+    assert is_blocked_ip("::ffff:8.8.8.8") is False
+
+
+def test_is_blocked_ip_operator_deny_list(monkeypatch):
+    """ARGUS_DENY_IPS: the box's own public IP is not a private range, yet dialing it
+    reaches the host's sshd/panel. Compared in canonical form (compressed IPv6 too)."""
+    from argus.security import ssrf
+
+    monkeypatch.setattr(ssrf, "DENY_IPS", frozenset({"43.134.17.144", "2606:4700::1111"}))
+    assert is_blocked_ip("43.134.17.144") is True
+    assert is_blocked_ip("2606:4700:0000::1111") is True  # uncompressed spelling
+    assert is_blocked_ip("43.134.17.145") is False
+
+
+def test_deny_ips_env_parsing(monkeypatch, caplog):
+    from argus import config
+
+    out = config._parse_deny_ips(" 43.134.17.144 , not-an-ip,, 2606:4700:0000::1111 ")
+    assert out == frozenset({"43.134.17.144", "2606:4700::1111"})
+    assert "not-an-ip" in caplog.text
 
 
 # --------------------------------------------------------------------------- #

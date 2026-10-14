@@ -12,24 +12,13 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
-import re
 from urllib.parse import urlsplit
 
 from ..security.egress import guarded_browser_config
 from ..security.ssrf import DNSError, aresolve_and_validate, validate_url
-from .static import _DEFAULT_PORTS, FetchError
+from .static import _DEFAULT_PORTS, FetchError, _looks_blocked
 
-# Markers of an anti-bot interstitial (Cloudflare / Akamai / PerimeterX challenge pages).
-_BLOCK_MARKERS = (
-    "just a moment",
-    "checking your browser",
-    "cf-browser-verification",
-    "attention required",
-    "access denied",
-    "enable javascript and cookies",
-    "verify you are human",
-)
-_BLOCK_STATUSES = {403, 429, 503}
+__all__ = ["BrowserPool", "_looks_blocked"]  # _looks_blocked lives in static.py since 0.4.28
 
 # Outer wall-clock grace on top of Crawl4AI's own page_timeout: if Playwright/CDP wedges
 # (browser crash, hung pipe) page_timeout never fires and the semaphore permit would be
@@ -43,21 +32,6 @@ _DEAD_MARKERS = ("has been closed", "browser has disconnected", "target closed")
 def _browser_dead(res) -> bool:
     msg = (getattr(res, "error_message", "") or "").lower()
     return not getattr(res, "success", True) and any(m in msg for m in _DEAD_MARKERS)
-
-
-# crawl4ai verdicts that mean "thin page", not "wall": a tiny legit page or JS shell is the
-# thin-escalation path's business, and calling it blocked would fail a real read.
-_THIN_REASONS = ("Structural:", "Near-empty")
-# Our generic phrases ("access denied") appear in real docs; only trust them on short pages.
-_SHORT_PAGE = 10_000
-
-
-_TAG_OR_SCRIPT = re.compile(r"<(script|style)[^>]*>.*?</>|<[^>]+>", re.I | re.S)
-_CHALLENGE_TEXT_MAX = 3000  # visible chars; challenge pages carry a few hundred at most
-
-
-def _visible_chars(html: str) -> int:
-    return len(" ".join(_TAG_OR_SCRIPT.sub(" ", html[:200_000]).split()))
 
 
 async def _raise_if_landed_internal(landed: str | None, asked: str) -> None:
@@ -74,30 +48,6 @@ async def _raise_if_landed_internal(landed: str | None, asked: str) -> None:
         return  # about:blank, chrome-error://: not a navigation target
     with contextlib.suppress(DNSError):  # unresolvable is not an SSRF finding
         await aresolve_and_validate(parts.hostname, port)
-
-
-def _looks_blocked(html: str, status: int | None) -> bool:
-    """Heuristic: does this response look like an anti-bot challenge rather than content?
-
-    crawl4ai's detector supplies vendor fingerprints at any size (DataDome
-    captcha-delivery, PerimeterX, Incapsula, Kasada, Akamai reference ids, Cloudflare
-    challenge scripts) and generic phrases on error statuses; our markers add the
-    Cloudflare interstitial text a 200 challenge carries, on short pages only.
-    """
-    if status in _BLOCK_STATUSES:
-        return True
-    from crawl4ai.antibot_detector import is_blocked  # lazy: crawl4ai costs ~1 s to import
-
-    html = html or ""
-    blocked, reason = is_blocked(status, html)
-    # On a 2xx, a fingerprint/phrase hit must come with a thin page: an article about bot
-    # walls quotes "Pardon Our Interruption" or "Reference #" and is content, while a real
-    # interstitial carries almost no visible text. Error statuses need no corroboration.
-    thin = (status or 200) >= 400 or _visible_chars(html) < _CHALLENGE_TEXT_MAX
-    if blocked and thin and not reason.startswith(_THIN_REASONS):
-        return True
-    head = html[:4000].lower()
-    return len(html) < _SHORT_PAGE and any(m in head for m in _BLOCK_MARKERS)
 
 
 class BrowserPool:
@@ -170,7 +120,14 @@ class BrowserPool:
                             headless=True, verbose=False, enable_stealth=True
                         )
                     )
-                    await crawler.start()
+                    try:
+                        await crawler.start()
+                    except Exception as e:  # noqa: BLE001 - Playwright/OS launch errors
+                        # A raw launch error would reach the client unsanitised (tools only
+                        # catch FetchError); the half-started browser must not leak either.
+                        with contextlib.suppress(Exception):
+                            await crawler.close()
+                        raise FetchError("render_failed", "stealth launch failed") from e
                     self._stealth = crawler
         return self._stealth
 
@@ -245,9 +202,10 @@ class BrowserPool:
             verbose=False,
         )
 
-        crawler = await self._ensure_stealth() if stealth else self._crawler
         tier = "stealth" if stealth else "normal"
         async with self._sem:
+            # Launching the second Chromium inside the permit keeps it under the RAM guard.
+            crawler = await self._ensure_stealth() if stealth else self._crawler
             res = await self._bounded_arun(crawler, url, cfg, timeout, recycle_stealth=stealth)
             # Page errors say "closed" too (window.close, a crashed tab); only relaunch
             # when the browser process itself is confirmed gone.
@@ -263,13 +221,14 @@ class BrowserPool:
                     except Exception as e:  # noqa: BLE001 - relaunch failed; surface as render
                         raise FetchError("render_failed", "browser relaunch failed") from e
 
-        # Auto-escalate to the stealth tier once on an anti-bot block.
+        # Auto-escalate to the stealth tier once on an anti-bot block. The verdict is
+        # computed once and reused: _looks_blocked scans the page each time.
         blocked = not res.success or _looks_blocked(
             getattr(res, "html", ""), getattr(res, "status_code", None)
         )
         if not stealth and blocked:
-            stealth_crawler = await self._ensure_stealth()
             async with self._sem:
+                stealth_crawler = await self._ensure_stealth()
                 res2 = await self._bounded_arun(
                     stealth_crawler, url, cfg, timeout, recycle_stealth=True
                 )
@@ -278,22 +237,19 @@ class BrowserPool:
             if res2.success and not _looks_blocked(
                 getattr(res2, "html", ""), getattr(res2, "status_code", None)
             ):
-                res, tier = res2, "stealth"
+                res, tier, blocked = res2, "stealth", False
             else:  # discarded, but if it ended on an internal host that is the real cause
                 await _raise_if_landed_internal(getattr(res2, "redirected_url", None), url)
 
         # A redirect to an internal host is refused by the egress proxy and lands here as a
         # failed or blocked page; say ssrf_blocked, which callers do not retry.
-        if not res.success or _looks_blocked(
-            getattr(res, "html", ""), getattr(res, "status_code", None)
-        ):
+        if blocked:
             await _raise_if_landed_internal(getattr(res, "redirected_url", None), url)
 
         if not res.success:
-            still_blocked = _looks_blocked(
+            code = "blocked_by_antibot" if _looks_blocked(
                 getattr(res, "html", ""), getattr(res, "status_code", None)
-            )
-            code = "blocked_by_antibot" if still_blocked else "render_failed"
+            ) else "render_failed"
             raise FetchError(code, res.error_message or "render failed")
         # Truthfulness gate: a success=True result that is still a challenge page (both
         # tiers blocked, or the direct stealth path hit a wall) must surface as
@@ -302,9 +258,7 @@ class BrowserPool:
         # EXCEPTION: a screenshot request returns whatever was captured - "show me what
         # the page looks like" is legitimate even for a challenge page, and the PNG is
         # already in hand.
-        if not screenshot and _looks_blocked(
-            getattr(res, "html", ""), getattr(res, "status_code", None)
-        ):
+        if not screenshot and blocked:
             raise FetchError(
                 "blocked_by_antibot", "challenge page persists after stealth escalation"
             )

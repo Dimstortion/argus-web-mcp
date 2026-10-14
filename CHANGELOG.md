@@ -14,6 +14,115 @@ All notable changes, in [Keep a Changelog](https://keepachangelog.com/) style. D
 
 ---
 
+## [0.4.28] - 2026-10-14 - production audit: event-loop DoS, decompression bomb, fail-closed auth, actionable errors
+
+Three independent reviews (security, code quality, performance) plus the 2026-10-04
+reference study were worked through by measurement where the workstation allowed it;
+full write-up in `docs/qa/2026-10-14-production-audit.md`. The suite was written
+alongside the code but could not run in the authoring session (its command tools were
+refused by a safety filter mid-way); verified 2026-10-15: ruff clean, 1070 offline tests
+green, SSRF 100% line + branch. That run fixed one real gap the new test caught:
+`_looks_blocked` gated its Cloudflare markers on raw page length and a 4 KB prefix, so an
+interstitial padded with inline JS passed as content; it now gates on visible text.
+
+### Security
+
+- **Quadratic regexes on the event loop.** `_visible_text_len` (`<[^>]+>`) took 11 s on
+  100 KB of `<` and the browser tier's `_TAG_OR_SCRIPT` 17 s on 20k unclosed `<script>`
+  (measured): one hostile page froze every tool and `/health`. Both are now one linear
+  lxml pass (`static.visible_text_len`, first 200k chars), shared by both tiers.
+- **Brotli decompression bomb.** httpx inflates each raw chunk before the streaming cap
+  counts it, and brotli packs 200 MB of zeros into 329 bytes (measured). Argus now asks
+  for `gzip, deflate` only and refuses any other `content-encoding` (`fetch_failed`).
+- **The box's own public IP passed the SSRF gate** (not a private range; from the
+  container it reaches the host's sshd, measured 2026-10-04). `ARGUS_DENY_IPS`
+  (comma-separated, canonicalised) is an operator deny-list; compose defaults it to the
+  SURIOTA VPS. NAT64 `64:ff9b::/96` and the other IPv4-in-IPv6 forms are unwrapped and
+  re-checked. SSRF coverage stays at 100% line + branch.
+- **WebRTC bypassed the egress proxy.** Chromium now runs with
+  `--webrtc-ip-handling-policy=disable_non_proxied_udp` (+ forced), so page JS cannot STUN
+  at private ranges or learn the real IP.
+- **Auth failed open.** With neither `ARGUS_TOKEN` nor `ARGUS_JWT_JWKS_URI` set, the
+  container came up on 0.0.0.0 with no auth. The ASGI `app` is now built on first access
+  and refuses to start without auth unless `ARGUS_ALLOW_NOAUTH=1` (set only by the
+  loopback-only local overlay). A JWKS without `ARGUS_JWT_ISSUER` + `ARGUS_JWT_AUDIENCE`
+  (which accepted any token the JWKS ever signed) refuses to start too.
+- **Client-supplied XPath ran on the loop** (`extract_structured`, `watch`): cubic
+  selectors stalled everything, and a watch persisted them across restarts. Both now run
+  off the loop with a 15 s budget, and `watch` rejects a selector with a syntax error at
+  registration (`schema_invalid`).
+- Webhook URLs (Telegram bot tokens) are no longer logged in full on delivery failure.
+  Metrics labels only accept real tool names (a client-chosen name grew `/metrics`
+  without bound and could corrupt its text format).
+
+### Fixed
+
+- **`_TAG_OR_SCRIPT` closed on `</>`** (a typo), so script bodies counted as visible text:
+  a 200 interstitial carrying a few KB of inline JS passed the thin-page check and was
+  returned, and cached, as content. Gone with the shared `visible_text_len`.
+- **2xx anti-bot walls on the static path.** `fetch_static` escalated 401/403/429/503/5xx
+  only; a 200 "Just a moment..." was content. It now raises `blocked_by_antibot` on
+  Cloudflare `cf-mitigated: challenge`, AWS WAF `x-amzn-waf-action`, and the same body
+  heuristic the browser tier uses (vendor fingerprints with thin-page corroboration,
+  interstitial phrases on short pages).
+- **A bad port raised straight to the client.** `urlsplit().port` raises `ValueError` for
+  `:99999` (confirmed); `validate_url` now refuses it as `ssrf_blocked`, and a hostile
+  redirect `Location` is `fetch_failed` instead of an unhandled exception. One watch with
+  such a webhook stalled every later watch forever; `poll_due` also guards delivery.
+- **A trickling body defeated every timeout** (httpx timeouts are per socket read, so one
+  byte every few seconds passed the 5 s static hop for up to 32 MB). The whole body read
+  gets the hop's budget as a wall clock (`body read exceeded Ns`).
+- **No ceiling on `read`, `screenshot`, `batch_read`, `read_pdf` extraction.** `read` is
+  bounded at `timeout + 45` s (one browser rung past the client's budget), `screenshot`
+  at `timeout` like `scrape`, `batch_read` has a whole-batch deadline (new `timeout`
+  parameter, default `TIMEOUTS["batch_read"]`) that returns the finished reads and flags
+  the rest (`budget_exhausted`), `read_pdf` abandons extraction past `timeout`
+  (`parse_failed`, reason `timeout`; the single PDF thread still finishes on its own), and
+  `extract_structured` caps its list at 200 URLs with a per-call budget.
+- **Wayback copies were cached and watched as live content**: `read` no longer caches a
+  `render_path: "archive"` result, and `check_watch` reports `archive_only` instead of
+  hashing it (one blip no longer fires two change events).
+- **`watch` selector miss hashed the whole page** (change event on every ad rotation,
+  from the reference study): now `error: selector_not_found`, previous hash kept.
+- **Half-open breaker let a whole burst through** before the trial's verdict; it re-arms
+  so exactly one trial runs. **A corrupt gzip cache blob raised on every read** for up to
+  7 days (`zlib.error` is neither `OSError` nor `ValueError`); it self-heals now.
+- **Search cache key collision**: `["a", "b"]` (two RRF-merged searches) and `"a b"`
+  shared a row. `count` is clamped to 1-100 (it busted the key and reranked five pages
+  for nothing). **`smart_search` sent its routing words to GitHub**: "fastmcp github
+  repository" answered `no_results` and fell back to general; the signal words are
+  stripped first.
+- **A stealth Chromium launch failure, a sqlite error or any other unmapped exception
+  reached the client as FastMCP's raw `str(exc)`.** The middleware now returns
+  `internal_error` with the sanitized class name, and the stealth launch is wrapped
+  (and launched inside the RAM-guard permit, not before it).
+- Research `highlights` ran after the call's deadline with no bound of their own (20 s
+  budget now); the hourly cache purge, sitemap XML parsing (capped at 8 MiB) and the
+  ONNX embedder (serialised: each concurrent run allocated its own arena) are off the
+  loop or bounded; `PRAGMA synchronous=NORMAL` drops the per-commit fsync; DNS lookups
+  get their own thread pool so extraction no longer starves them into `dns_failed`.
+  A damaged `watches.json` row no longer keeps the server from starting.
+
+### Added
+
+- **Actionable errors** (reference study E1): fetch errors carry `http_status`, `reason`
+  (`http_500`, `timeout`, `transport`, `circuit_open`, `cached_failure`, ...) and
+  `retryable`; SSRF refusals carry `retryable` too. A stale cache copy served because the
+  live fetch failed is flagged `stale: true` with `cached_at` (E2).
+- `read`, `search` and `research` declare `anthropic/alwaysLoad` so Claude Code ships
+  their schemas with the server instructions (E5); `search.query/count`, `read_pdf.pages`,
+  `research.max_sources`, `github_search.query/sort` and `batch_read.*` carry parameter
+  descriptions (E6).
+
+### Not adopted (measured or reasoned)
+
+- Container `cap_drop: [ALL]` / `pids_limit`: unverifiable without a Docker host in this
+  session; deferred, see the audit doc. `backend` in search results still names the
+  SearXNG hostname (harmless: the gate blocks it). Wayback lookups still send the full
+  URL (that is what the agent asked to read).
+
+---
+
 ## [0.4.27] - 2026-10-04 - DataDome 401, honest SSRF codes, a daily reachability map
 
 ### Fixed

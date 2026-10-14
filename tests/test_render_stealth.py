@@ -30,6 +30,18 @@ def test_looks_blocked_markers():
     assert not _looks_blocked("<article>real content</article>", 200)
 
 
+def test_looks_blocked_does_not_count_script_bodies_as_visible_text():
+    """The old tag regex closed on '</>' (a typo), so an interstitial carrying a few KB of
+    inline JS counted as a rich page and passed as content."""
+    from argus.fetch.static import visible_text_len
+
+    page = ("<html><head><script>" + "var x=1;" * 1000 + "</script></head>"
+            "<body><h1>Just a moment...</h1><p>Checking your browser</p></body></html>")
+    assert visible_text_len(page) < 100  # the 8 KB script body is not visible text
+    assert _looks_blocked(page, 200)
+    assert visible_text_len("<style>p{}</style><p>hi</p><script>var y</script>") == 2
+
+
 async def test_render_escalates_to_stealth_on_block(monkeypatch):
     pool = BrowserPool()
 
