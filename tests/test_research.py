@@ -12,7 +12,7 @@ import re
 import pytest
 
 from argus.fetch.static import FetchError
-from argus.research import research
+from argus.research import _SPARE, research
 from argus.security.ssrf import SSRFError
 
 # A real, content-rich article so the real extract_article recovers a non-empty body.
@@ -177,8 +177,8 @@ async def test_overfetch_cap_and_dedup():
 
     # overfetched at max_sources*3 (larger pool gives backfill more spares)
     assert rec_search["count"] == 9
-    # only top-3 DISTINCT urls fetched
-    assert rec_fetch["calls"] == 3
+    # top-3 DISTINCT urls win, in rank order; at most _SPARE extra candidates were fetched
+    assert 3 <= rec_fetch["calls"] <= 3 + _SPARE
     assert out["count"] == 3
     assert [s["url"] for s in out["sources"]] == [
         "https://example.com/1",
@@ -790,8 +790,12 @@ async def test_deep_backfill_no_waste_on_happy_path():
 
     assert out["count"] == 3
     assert out["failed"] == []
-    # Exactly 3 fetches -- spares 4,5,6 must NOT be touched
-    assert rec_fetch["calls"] == 3
+    # 3 wanted + _SPARE in flight: candidate 6 must NOT be touched; the first three good
+    # pages win (a spare may displace a slower higher-ranked one), returned in rank order
+    assert rec_fetch["calls"] <= 3 + _SPARE
+    got = [s["url"] for s in out["sources"]]
+    assert got == sorted(got, key=lambda u: int(u.rsplit("/", 1)[1]))
+    assert set(got) <= {f"https://example.com/{i}" for i in (1, 2, 3, 4, 5)}
 
 
 # --------------------------------------------------------------------------- #
@@ -1128,22 +1132,36 @@ def _slow_fetch(slow_url):
     return _fetch
 
 
-async def test_deep_slow_source_bounded_per_source():
+async def test_deep_slow_source_does_not_hold_the_bundle():
+    t0 = asyncio.get_running_loop().time()
     out = await research(
         "q", max_sources=3, timeout=3,  # per-source bound = 1 s, deadline 2.7 s
         search_fn=_fake_search([_search_result(i) for i in range(1, 5)]),
         fetch_fn=_slow_fetch("https://example.com/2"),
     )
-    assert out["count"] == 3  # backfilled from the spare candidate
+    # the spare (4) answers while 2 is still loading: 2 gets its per-source bound (1 s,
+    # under the rank grace) and is then dropped, instead of holding the bundle for 10 s
+    assert [s["url"] for s in out["sources"]] == [f"https://example.com/{i}" for i in (1, 3, 4)]
     assert out["failed"] == [{"url": "https://example.com/2", "error": "timeout"}]
     assert out["degraded"] is False
+    assert asyncio.get_running_loop().time() - t0 < 2.0
+
+
+async def test_deep_slow_source_bounded_per_source():
+    out = await research(
+        "q", max_sources=3, timeout=3,  # per-source bound = 1 s, deadline 2.7 s
+        search_fn=_fake_search([_search_result(i) for i in range(1, 4)]),  # no spare left
+        fetch_fn=_slow_fetch("https://example.com/2"),
+    )
+    assert [s["url"] for s in out["sources"]] == [f"https://example.com/{i}" for i in (1, 3)]
+    assert out["failed"] == [{"url": "https://example.com/2", "error": "timeout"}]
 
 
 async def test_deep_deadline_returns_partial_bundle(monkeypatch):
     monkeypatch.setattr("argus.research._DEADLINE_FRACTION", 0.05)  # deadline 0.3 s
     out = await research(
         "q", max_sources=3, timeout=6,  # per-source bound 2 s, longer than the deadline
-        search_fn=_fake_search([_search_result(i) for i in range(1, 5)]),
+        search_fn=_fake_search([_search_result(i) for i in range(1, 4)]),
         fetch_fn=_slow_fetch("https://example.com/2"),
     )
     assert [s["url"] for s in out["sources"]] == ["https://example.com/1", "https://example.com/3"]
@@ -1197,7 +1215,7 @@ async def test_deep_fetches_at_most_two_per_host_first():
         search_fn=_fake_search([_search_result(i, url=u) for i, u in enumerate(urls)]),
         fetch_fn=_fake_fetch(dict.fromkeys(urls, ARTICLE_HTML), recorder=rec),
     )
-    assert sorted(rec["urls"]) == sorted(
+    assert sorted(rec["urls"][:3]) == sorted(  # first pass: <=2 per host; spares follow
         ["https://big.example/0", "https://big.example/1", "https://other.example/x"]
     )
     assert out["count"] == 3

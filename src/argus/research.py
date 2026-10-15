@@ -58,6 +58,10 @@ _SOURCE_CAP = 50.0
 _DEADLINE_FRACTION = 0.9
 # First-pass cap per host when picking sources to fetch, so one site cannot fill the bundle.
 _PER_HOST = 2
+# Extra candidates kept in flight by _deep_bundle beyond the sources still wanted, and
+# how long a better-ranked page may keep loading once enough pages are in hand.
+_SPARE = 2
+_RANK_GRACE = 3.0
 
 Progress = Callable[[int, int, str], Awaitable[None]]
 
@@ -211,11 +215,14 @@ async def _deep_bundle(
     candidates, *, fetch_fn, fetch_bytes_fn, client, browser, timeout, concurrency,
     target: int = 0, throttle=None, deadline: float | None = None, on_done=None,
 ) -> tuple[list, list, bool]:
-    """Fetch+extract `candidates` in waves until `target` good sources collected.
+    """Fetch+extract `candidates` until `target` good sources are collected.
 
-    `target=0` (or target >= len(candidates)) fetches the whole list in one wave
-    (original behaviour).  When target > 0 and the first wave yields enough good
-    sources, spare candidates are left untouched (no wasted fetches).
+    `target + _SPARE` candidates are in flight at once; once `target` good pages are in
+    hand, a higher-ranked page still loading gets `_RANK_GRACE` more seconds, then the
+    best-ranked `target` good pages win and the rest are cancelled, not failed. A wave
+    that waited for its slowest page put research at p95 34 s (2026-10-15, 24 queries);
+    here a slow or dead page costs at most the grace while a spare is answering. A
+    failure launches the next candidate. `target=0` fetches the whole list.
 
     `deadline` (loop time): fetches still running then are cancelled and recorded as
     `budget_exhausted`; the third return value says whether that happened.
@@ -224,14 +231,9 @@ async def _deep_bundle(
     """
     fetch_fn = fetch_fn or _default_fetch
     fetch_bytes_fn = fetch_bytes_fn or _default_fetch_bytes
-    sem = asyncio.Semaphore(concurrency)
-    sources: list[dict] = []
-    failed: list[dict] = []
-    i = 0
+    sem = asyncio.Semaphore(concurrency)  # spares take a slot as soon as one frees
     want = target or len(candidates)  # 0 -> fetch all
     loop = asyncio.get_running_loop()
-    exhausted = False
-
     reports: set = set()  # in-flight progress sends, flushed before returning
 
     async def _tracked(url):
@@ -245,28 +247,56 @@ async def _deep_bundle(
             reports.add(asyncio.ensure_future(on_done(rec)))
         return rec
 
-    while i < len(candidates) and len(sources) < want and not exhausted:
-        wave = candidates[i : i + (want - len(sources))]
-        i += len(wave)
-        tasks = [asyncio.ensure_future(_tracked(r["url"])) for r in wave]
-        left = None if deadline is None else max(deadline - loop.time(), 0)
-        try:
-            _done, pending = await asyncio.wait(tasks, timeout=left)
-        finally:
-            # Deadline or caller cancellation: stop the stragglers and wait for them, so
-            # none keeps a browser permit or throttle slot after research returns.
-            stragglers = [t for t in tasks if not t.done()]
-            for t in stragglers:
-                t.cancel()
-            await asyncio.gather(*stragglers, return_exceptions=True)
-        exhausted = bool(pending)
-        for r, t in zip(wave, tasks, strict=True):
-            rec = {"url": r["url"], "ok": False, "error": "budget_exhausted"}
-            rec = rec if t in pending else t.result()
-            if rec["ok"]:
-                sources.append({k: v for k, v in rec.items() if k != "ok"})
-            else:
-                failed.append({"url": rec["url"], "error": rec["error"]})
+    tasks: dict[asyncio.Task, int] = {}  # task -> candidate index
+    good: dict[int, dict] = {}
+    failed: list[dict] = []
+    nxt = 0
+    exhausted = False
+
+    def _launch():
+        nonlocal nxt
+        spare = _SPARE if target else 0
+        while nxt < len(candidates) and len(tasks) < want - len(good) + spare:
+            tasks[asyncio.ensure_future(_tracked(candidates[nxt]["url"]))] = nxt
+            nxt += 1
+
+    _launch()
+    satisfied_at = None  # loop time when `want` good pages were first in hand
+    try:
+        while tasks:
+            chosen = sorted(good)[:want]
+            wait = None
+            if len(chosen) >= want:
+                satisfied_at = satisfied_at or loop.time()
+                if not any(i < chosen[-1] for i in tasks.values()):
+                    break  # nothing better-ranked still loading
+                wait = max(satisfied_at + _RANK_GRACE - loop.time(), 0)
+            left = None if deadline is None else max(deadline - loop.time(), 0)
+            budgets = [x for x in (wait, left) if x is not None]
+            budget = min(budgets) if budgets else None
+            done, _ = await asyncio.wait(tasks, timeout=budget, return_when=asyncio.FIRST_COMPLETED)
+            if not done:
+                exhausted = satisfied_at is None  # the deadline, not the grace, ran out
+                break
+            for t in done:
+                rec = t.result()
+                if rec["ok"]:
+                    good[tasks.pop(t)] = rec
+                else:
+                    tasks.pop(t)
+                    failed.append({"url": rec["url"], "error": rec["error"]})
+            if len(good) < want:
+                _launch()
+    finally:
+        # Deadline, enough sources, or caller cancellation: stop the stragglers and wait
+        # for them, so none keeps a browser permit or throttle slot after research returns.
+        for t in tasks:
+            t.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)
+    if exhausted:
+        failed += [{"url": candidates[i]["url"], "error": "budget_exhausted"}
+                   for i in sorted(tasks.values())]
+    sources = [{k: v for k, v in good[i].items() if k != "ok"} for i in sorted(good)[:want]]
     if reports:  # a report that lands after the result is useless; give them a moment
         await asyncio.wait(reports, timeout=2)
     return sources, failed, exhausted

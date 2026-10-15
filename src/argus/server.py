@@ -931,7 +931,10 @@ async def research(
     hits (title/url/snippet) only, zero fetches (fast). `highlights`=True attaches the top
     query-relevant sentences per source (local embeddings; deep mode). `max_chars_per_source`
     (opt-in) caps each source's content for token-sensitive callers; truncation is FLAGGED
-    (truncated=True + full_chars), word_count preserved - default None returns FULL content."""
+    (truncated=True + full_chars), word_count preserved - default None returns FULL content.
+    Full content of 5 sources is ~8k words: for a short synthesis or a quick fact, pass
+    `max_chars_per_source=3000` or `highlights=True` (or mode='quick'); keep the default when
+    you will quote, follow or cite the pages."""
     s = _state()
     # Unbounded, max_sources=1000 meant ~3000 search hits and 1000 renders on a 2 vCPU box.
     max_sources = min(max(1, max_sources), 10)

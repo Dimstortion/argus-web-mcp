@@ -6,7 +6,9 @@ took 10.5 s sequentially, 10.7 s on 2 threads and 14.0 s on 4 (GIL thrash), agai
 extractions at once, so on the 2-vCPU VPS they were slower than serial and starved the
 loop. Workers are spawned (never forked: the parent runs ONNX and Chromium threads) and
 import only the extract package. ``ARGUS_EXTRACT_WORKERS=0`` keeps the thread path
-(tests, tiny hosts).
+(tests, tiny hosts). Spawn re-imports the main module in each worker, so a script that
+calls into Argus needs an ``if __name__ == "__main__"`` guard (uvicorn has one) or that
+setting; without either, every extraction fails as ``extract_failed``.
 """
 
 from __future__ import annotations

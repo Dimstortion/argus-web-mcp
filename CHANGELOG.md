@@ -14,6 +14,40 @@ All notable changes, in [Keep a Changelog](https://keepachangelog.com/) style. D
 
 ---
 
+## [0.4.30] - 2026-10-15 - research tail: first-done-wins bundle
+
+Follow-up to the native-tools benchmark, which put `research(deep)` at p95 34 s on the
+VPS: `_deep_bundle` fetched exactly `max_sources` candidates per wave and waited for the
+slowest page (a per-source bound of up to 50 s) before backfilling.
+
+### Performance
+
+- **First-done-wins bundle** (`research._deep_bundle`, `_SPARE = 2`, `_RANK_GRACE = 3 s`).
+  `max_sources + 2` candidates are in flight; once enough good pages are in hand, a
+  better-ranked page still loading gets 3 s more, then the best-ranked good pages win and
+  the rest are cancelled (not reported as failed). A failure launches the next candidate
+  at once. Measured on the benchmark's 24 candidate lists with real static fetches, old
+  and new run sequentially A-B-A on the same box: old p50 3.9 / 2.5 s, p95 27.9 / 21.2 s,
+  max 61.9 / 21.2 s; new p50 2.7 s, p95 8.7 s, max 8.8 s; all 24 queries still return 5
+  sources with the same content volume (7.5k vs 7.7-8.3k words). The `concurrency` bound
+  is unchanged: spares take a slot as soon as one frees.
+- **Tool guidance** (`research` docstring): full content of 5 sources is ~8k words; for a
+  short synthesis the agent is pointed at `max_chars_per_source=3000`, `highlights=True`
+  or `mode='quick'`. The agent-level benchmark showed Argus 36% cheaper but 40% slower end
+  to end because the agent read all 8k words for a 5-sentence answer.
+
+### Checked, not an Argus bug
+
+Search hits carried no date in 240/240 results. `search` already passes SearXNG's
+`publishedDate` through as `published` (tested); the SearXNG engines reachable from the
+VPS, `brave.news` included, send none. Needs a look at the SearXNG side from the VPS.
+
+### Harness note
+
+An ad-hoc script that calls Argus extraction in-process needs an `if __name__ ==
+"__main__"` guard or `ARGUS_EXTRACT_WORKERS=0`: the spawn pool re-imports `__main__` in
+each worker (documented in `extract/pool.py`; cost one A/B run).
+
 ## [0.4.29] - 2026-10-15 - extraction tuned by measurement: off the GIL, one trafilatura pass
 
 Profiled the read path on real pages (ESP-IDF, Python docs, GitHub, news; 140-520 KB):
