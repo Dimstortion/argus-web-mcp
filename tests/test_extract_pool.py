@@ -78,3 +78,14 @@ def test_warm_logs_a_failed_worker(caplog):
 def test_bad_worker_count_falls_back_to_default(monkeypatch):
     monkeypatch.setenv("ARGUS_EXTRACT_WORKERS", "two")
     assert pool.workers() >= 1
+
+
+async def test_wedged_extraction_is_killed_and_the_pool_recovers(monkeypatch):
+    monkeypatch.setenv("ARGUS_EXTRACT_WORKERS", "1")
+    monkeypatch.setattr(pool, "_EXTRACT_TIMEOUT_S", 0.0)  # every extraction "hangs"
+    first = pool._get_pool()
+    got = await pool.extract_async(HTML, URL)
+    assert got["content"] == "" and pool._pool is None  # empty result, workers recycled
+    monkeypatch.setattr(pool, "_EXTRACT_TIMEOUT_S", 30.0)
+    assert (await pool.extract_async(HTML, URL))["content"]
+    assert pool._pool is not first

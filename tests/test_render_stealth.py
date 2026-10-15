@@ -30,6 +30,14 @@ def test_looks_blocked_markers():
     assert not _looks_blocked("<article>real content</article>", 200)
 
 
+def test_looks_blocked_ignores_markers_inside_script_bodies():
+    """A thin SPA shell carries error strings in its bundle; that is not a wall."""
+    spa = ('<div id="root"></div><script>const t={denied:"Access denied"};</script>'
+           '<script src="/app.js"></script>')
+    assert not _looks_blocked(spa, 200)
+    assert _looks_blocked('<div class="cf-browser-verification"></div><script>x</script>', 200)
+
+
 def test_looks_blocked_does_not_count_script_bodies_as_visible_text():
     """The old tag regex closed on '</>' (a typo), so an interstitial carrying a few KB of
     inline JS counted as a rich page and passed as content."""

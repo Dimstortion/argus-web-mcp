@@ -14,6 +14,25 @@ All notable changes, in [Keep a Changelog](https://keepachangelog.com/) style. D
 
 ---
 
+## [0.4.31] - 2026-10-15 - review fixes on the 0.4.28-0.4.30 merge
+
+Two findings from an independent review of the contributed 0.4.28-0.4.30 commits.
+
+### Fixed
+
+- **A wedged extraction worker no longer stalls every later read** (`extract/pool.py`).
+  Cancelling an await never stops a worker process, and `read`'s timeout covered only
+  the fetch, so two stuck pages (the default pool size) queued every extraction until a
+  restart. Extraction now has a 30 s ceiling (`_EXTRACT_TIMEOUT_S`); past it the workers
+  are killed, the pool is rebuilt, and the call returns empty content (`empty_content`).
+- **Thin SPA shells are no longer reported as anti-bot walls** (`fetch/static.py`).
+  Since 0.4.28 the block markers were matched across the whole markup, so a JS app shell
+  whose bundle carries a string like "Access denied" raised `blocked_by_antibot`. Script
+  bodies are now skipped; class names and titles still count.
+
+Not changed: the VPS IP default in `docker-compose.yml`. It was already in nine tracked
+files of this public repo before 0.4.28, so removing one copy would hide nothing.
+
 ## [0.4.30] - 2026-10-15 - research tail: first-done-wins bundle
 
 Follow-up to the native-tools benchmark, which put `research(deep)` at p95 34 s on the

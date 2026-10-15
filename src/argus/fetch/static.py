@@ -86,9 +86,13 @@ def _looks_blocked(html: str, status: int | None) -> bool:
         return True
     # Markers can be class names, so scan the markup (bounded above), not the visible text;
     # inline JS pushes them past any fixed prefix, and the thin gate keeps a real article
-    # that quotes "access denied" from counting as a wall.
-    low = html.lower()
-    return vlen < _CHALLENGE_TEXT_MAX and any(m in low for m in _BLOCK_MARKERS)
+    # that quotes "access denied" from counting as a wall. Script bodies are skipped: a
+    # thin SPA shell ships i18n strings like "Access denied" in its bundle.
+    if vlen >= _CHALLENGE_TEXT_MAX:
+        return False
+    head, *rest = html.lower().split("<script")  # linear, unlike a lazy <script>.*? regex
+    low = head + " ".join(part.partition("</script>")[2] for part in rest)
+    return any(m in low for m in _BLOCK_MARKERS)
 
 
 def _challenge_headers(resp: httpx.Response) -> bool:

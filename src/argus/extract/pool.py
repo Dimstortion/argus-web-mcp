@@ -25,6 +25,9 @@ from .article import extract_article
 
 logger = logging.getLogger(__name__)
 _pool: cf.ProcessPoolExecutor | None = None
+# Typical pages take 0.35-1.5 s. A worker stuck past this is killed: cancelling the await
+# never stops a process, and two wedged workers would otherwise queue every later read.
+_EXTRACT_TIMEOUT_S = 30.0
 
 
 def workers() -> int:
@@ -48,7 +51,11 @@ async def extract_async(html: str, url: str, **kw):
     loop = asyncio.get_running_loop()
     pool = _get_pool()
     try:
-        return await loop.run_in_executor(pool, fn)
+        return await asyncio.wait_for(loop.run_in_executor(pool, fn), _EXTRACT_TIMEOUT_S)
+    except TimeoutError:
+        logger.warning("extraction of %s exceeded %gs; recycling workers", url, _EXTRACT_TIMEOUT_S)
+        _retire(pool, kill=True)
+        return extract_article("", url, **kw)  # same shape, empty content -> empty_content
     except cf.process.BrokenProcessPool:  # a worker died (OOM kill): rebuild once, retry
         _retire(pool)
         pool = _get_pool()
@@ -60,10 +67,15 @@ async def extract_async(html: str, url: str, **kw):
             return await asyncio.to_thread(extract_article, html, url, **kw)
 
 
-def _retire(pool: cf.ProcessPoolExecutor) -> None:
+def _retire(pool: cf.ProcessPoolExecutor, kill: bool = False) -> None:
     """Drop ``pool`` only if it is still the current one: every caller in flight sees the
-    same broken pool, and the second must reuse the first's replacement, not kill it."""
+    same broken pool, and the second must reuse the first's replacement, not kill it.
+    ``kill`` ends its workers too (a wedged one ignores shutdown); callers still waiting
+    on it get BrokenProcessPool and take the rebuild path."""
     if _pool is pool:
+        if kill:
+            for proc in list((pool._processes or {}).values()):  # no public API before 3.14
+                proc.kill()
         shutdown()
 
 
