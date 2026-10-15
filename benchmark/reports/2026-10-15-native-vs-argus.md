@@ -147,6 +147,49 @@ With the research tail fixed, the Argus-equipped agent is now faster than the na
 at p50 (20 s vs 28 s), equal at p95, and 42% cheaper per query; every one of the 24
 scenarios got faster (worst case 96 s -> 35 s).
 
+## 4c. Answer quality: a blind judge, and what it changed
+
+Both arms were re-run with the answer text kept (second repetition: native $0.214, p50
+27.3 s; Argus $0.121, p50 22.1 s; 24/24 each), then Claude Sonnet 5.5 graded each pair
+blind (A/B randomised; the whole pass repeated with A/B swapped).
+
+| | native arm | Argus arm |
+|---|---|---|
+| wins, consistent in both orders (24 pairs) | 15 | 4 (5 flipped with position) |
+| accuracy (1-5, pooled) | 4.21 | 4.06 |
+| source quality (1-5) | 3.94 | 3.27 |
+| specificity (1-5) | 4.50 | 3.90 |
+| authoritative-looking citations | 24% (arxiv 8x, docs.espressif 4x) | 12% (zeonedge, imraan.in, dataintelo) |
+
+The pool was not the problem: a 30-hit probe found authoritative pages at 19-20% of ranks
+11-30 but 15% of the top 10. The rerank preferred keyword-dense SEO pages. 0.4.33 adds a
+bounded authority prior; offline on these pools it lifts the authoritative share of the
+top 5 from 14% to 48% (native's list: 32%) with 4.75 of the old top 5 still in the top 10.
+The judge is re-run after deploy to confirm the answers improve, not just the ranks.
+
+## 4d. Multi-user load (live VPS)
+
+| concurrent agents (research deep + read each) | research p50 / max | read p50 / max | errors |
+|---|---|---|---|
+| 1 | 5.4 / 5.4 s | 2.0 / 2.0 s | 0 |
+| 3 | 12.9 / 16.8 s | 0.6 / 1.8 s | 0 |
+| 5 | 15.2 / 20.4 s | 1.3 / 1.9 s | 0 |
+| 8 | 26.2 / 45.9 s | 1.8 / 3.2 s | 0 |
+
+Reads stay fast; research scales with the two extraction workers on two vCPUs.
+
+## 4e. Indonesian queries (16, same harness)
+
+| metric | native WebSearch | Argus search |
+|---|---|---|
+| Indonesian-language hits (title/snippet proxy) | 63 of 147 | 106 of 160 |
+| `.id` domains | 31 | 35 |
+| tool latency p50 | 8.0 s | 4.0 s |
+
+Argus research: 5 sources, 5,960 words, p95 18.4 s. Reads: 4 of 6 Indonesian pages in
+full; `kemenperin.go.id` refuses the VPS (fine from a residential IP; a WARP candidate),
+`idx.co.id` is a Cloudflare wall from everywhere. WebFetch summarised all six.
+
 ## 5. Factors that are not numbers
 
 | factor | native WebSearch / WebFetch | Argus |

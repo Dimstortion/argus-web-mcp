@@ -14,6 +14,43 @@ All notable changes, in [Keep a Changelog](https://keepachangelog.com/) style. D
 
 ---
 
+## [0.4.33] - 2026-10-15 - authority prior in the rerank, after a blind judge said the answers were worse-sourced
+
+### The finding
+
+A blind pairwise LLM judge (Claude Sonnet 5.5, A/B order randomised, then re-run with the
+order swapped) scored the 24 agent answers from the native WebSearch/WebFetch arm against
+the Argus-MCP arm. Consistent across both orders: native 15, Argus 4, 5 flipped. The gap
+was not accuracy (4.21 vs 4.06 of 5) but source quality (3.94 vs 3.27) and specificity
+(4.50 vs 3.90). The cited domains explained it: 24% of native's citations were
+authoritative-looking (arxiv 8x, docs.espressif 4x) against 12% of Argus's (zeonedge,
+imraan.in, dataintelo). A 30-hit probe showed the pool is not the problem: authoritative
+pages are 19-20% of ranks 11-30 but only 15% of the top 10, so the lexical+semantic rerank
+was pushing them down in favour of keyword-dense SEO copy. Per engine, google cse is 24%
+authoritative, duckduckgo 17%, yandex 10%, and bing answered 2 results in 24 queries (dead
+from this IP; the 0.4.32 engine alert will flag it).
+
+### Changed
+
+- **`search.rerank` authority prior** (`is_authoritative`, `_AUTHORITY_BOOST` 0.5 on the
+  lexical score, `_AUTHORITY_BOOST_SEM` 0.08 on the blended score): a bounded additive
+  bump for domain classes (official docs hosts, encyclopedic, academic, code hosts,
+  government/education, standards bodies, major newsrooms), applied only to relevant
+  results, so it reorders within relevance and never rescues an off-topic page. Swept
+  offline on the 24 live 30-hit pools: authoritative share of the top 5 went 14% -> 48%
+  and of the top 10 15% -> 40% (native's list: 32%), while 4.75 of the previous top 5
+  stay inside the top 10. `research` inherits it through search. The judge re-run on
+  the deployed server is the follow-up that closes the loop.
+
+### Measured, not changed
+
+- **Multi-user load** (live VPS, 1/3/5/8 concurrent agents each doing research(deep) +
+  read, cache-busted): zero errors at every level; read p50 stays 0.6-2.0 s; research
+  p50 5.4 s / 12.9 s / 15.2 s / 26.2 s. Extraction CPU (2 workers on 2 vCPU) is the
+  scaling limit; the lever is the VPS size, not code.
+- **Agent level, second repetition** (server 0.4.31): native 24/24, $0.214, p50 27.3 s,
+  p95 45.8 s; Argus 24/24, $0.121, p50 22.1 s, p95 38.8 s. Reproduces the first run.
+
 ## [0.4.32] - 2026-10-15 - the "everything else" batch: brief research, read cap, npm adapter, engine alert, Indonesian benchmark
 
 Worked from the 2026-10-15 benchmark's open list, every item measured.
