@@ -134,6 +134,19 @@ extraction ceiling), `argus_direct.py` was run again from the same workstation:
 Same yield, same or more content, and the tails that the first run flagged are gone: the
 slowest research call is now under 10 s against 36 s, the slowest read 6.6 s against 17 s.
 
+The agent-level `claude-argus` arm was then re-run (same 24 scenarios, prompt and model;
+the native arm is the morning's run):
+
+| arm | answered | cost mean / median | latency p50 / p95 / max (s) | sources cited | words |
+|---|---|---|---|---|---|
+| claude-native (0.4.27 run) | 24/24 | $0.211 / $0.171 | 28.4 / 37.3 / 41.8 | 6.67 | 290 |
+| claude-argus on 0.4.27 | 24/24 | $0.136 / $0.128 | 39.9 / 76.2 / 96.0 | 5.08 | 289 |
+| claude-argus on 0.4.31 | 24/24 | $0.122 / $0.104 | **20.3 / 36.8 / 43.7** | 5.12 | 274 |
+
+With the research tail fixed, the Argus-equipped agent is now faster than the native one
+at p50 (20 s vs 28 s), equal at p95, and 42% cheaper per query; every one of the 24
+scenarios got faster (worst case 96 s -> 35 s).
+
 ## 5. Factors that are not numbers
 
 | factor | native WebSearch / WebFetch | Argus |

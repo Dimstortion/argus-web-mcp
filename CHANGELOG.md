@@ -52,7 +52,10 @@ slowest page (a per-source bound of up to 50 s) before backfilling.
   is unchanged: spares take a slot as soon as one frees. Measured live on the VPS after
   deploy (with 0.4.29 and 0.4.31, same 24 queries, cold cache): research p95 34.4 s ->
   9.8 s, max 36.4 s -> 9.9 s, failed candidates 17 -> 4, same 5 sources and more words;
-  read p95 17.0 s -> 6.6 s; search p95 5.8 s -> 3.7 s.
+  read p95 17.0 s -> 6.6 s; search p95 5.8 s -> 3.7 s. Agent level (`claude -p` with
+  the Argus MCP, 24 scenarios): p50 39.9 s -> 20.3 s, p95 76.2 s -> 36.8 s, cost $0.136 ->
+  $0.122 per query, 24/24 answered; now faster than the native WebSearch/WebFetch arm at
+  p50 (28.4 s) and 42% cheaper.
 - **Tool guidance** (`research` docstring): full content of 5 sources is ~8k words; for a
   short synthesis the agent is pointed at `max_chars_per_source=3000`, `highlights=True`
   or `mode='quick'`. The agent-level benchmark showed Argus 36% cheaper but 40% slower end
