@@ -116,6 +116,24 @@ Per category (latency p50 native/Argus, cost mean native/Argus):
 
 Reading it: with Argus the agent makes one `research` call and writes; with the native tools it searches, then fetches several pages, each fetch a model round trip, which is why the native run costs more tokens even though its answer is the same length. The native run is faster end to end because WebSearch's summary is already "pre-digested" and the agent writes from it, while Argus hands back ~8k words that the agent reads before writing. The cost figure is tokens only (CLI `total_cost_usd`); it does not include the $10 per 1,000 web search fee, which would widen the gap. `run_4way`'s `total_tokens` counts uncached input + output only and is not comparable across the two arms (the native result text is cached by Claude Code), so cost is the honest token proxy here.
 
+## 4b. Same measurement after deploying 0.4.29-0.4.31 (same day, same harness, cold cache)
+
+The sections above were measured against 0.4.27. After the extraction pool, the
+single-pass extractor and the first-done-wins bundle went live (plus 0.4.31's 30 s
+extraction ceiling), `argus_direct.py` was run again from the same workstation:
+
+| metric | 0.4.27 | 0.4.31 |
+|---|---|---|
+| search p50 / p95 / max (s) | 3.8 / 5.8 / 8.7 | 3.1 / 3.7 / 3.8 |
+| research(deep) p50 / p95 / max (s) | 7.2 / 34.4 / 36.4 | 7.1 / 9.8 / 9.9 |
+| research sources per query, failed candidates | 5.0, 17 | 5.0, 4 |
+| research words per query (mean) | 8,410 | 9,125 |
+| read p50 / p95 / max (s), cold | 2.5 / 17.0 / 17.0 | 1.3 / 6.6 / 6.6 |
+| read URLs with content, browser-tier reads | 16/16, 2 | 16/16, 0 |
+
+Same yield, same or more content, and the tails that the first run flagged are gone: the
+slowest research call is now under 10 s against 36 s, the slowest read 6.6 s against 17 s.
+
 ## 5. Factors that are not numbers
 
 | factor | native WebSearch / WebFetch | Argus |

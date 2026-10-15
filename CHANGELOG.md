@@ -49,7 +49,10 @@ slowest page (a per-source bound of up to 50 s) before backfilling.
   and new run sequentially A-B-A on the same box: old p50 3.9 / 2.5 s, p95 27.9 / 21.2 s,
   max 61.9 / 21.2 s; new p50 2.7 s, p95 8.7 s, max 8.8 s; all 24 queries still return 5
   sources with the same content volume (7.5k vs 7.7-8.3k words). The `concurrency` bound
-  is unchanged: spares take a slot as soon as one frees.
+  is unchanged: spares take a slot as soon as one frees. Measured live on the VPS after
+  deploy (with 0.4.29 and 0.4.31, same 24 queries, cold cache): research p95 34.4 s ->
+  9.8 s, max 36.4 s -> 9.9 s, failed candidates 17 -> 4, same 5 sources and more words;
+  read p95 17.0 s -> 6.6 s; search p95 5.8 s -> 3.7 s.
 - **Tool guidance** (`research` docstring): full content of 5 sources is ~8k words; for a
   short synthesis the agent is pointed at `max_chars_per_source=3000`, `highlights=True`
   or `mode='quick'`. The agent-level benchmark showed Argus 36% cheaper but 40% slower end
