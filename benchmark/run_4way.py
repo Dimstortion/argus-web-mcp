@@ -444,6 +444,8 @@ def _build_command(condition: str, prompt: str, argus: dict | None) -> list[str]
         return [
             "claude", "-p", prompt,
             "--output-format", "json",
+            # fixed overhead: the CLI system prompt, not the operator's CLAUDE.md
+            "--setting-sources", "", "--disable-slash-commands",
             "--strict-mcp-config",
             "--mcp-config", tmp.name,
             "--allowedTools",
@@ -458,6 +460,8 @@ def _build_command(condition: str, prompt: str, argus: dict | None) -> list[str]
         return [
             "claude", "-p", prompt,
             "--output-format", "json",
+            # fixed overhead: the CLI system prompt, not the operator's CLAUDE.md
+            "--setting-sources", "", "--disable-slash-commands",
             "--strict-mcp-config",
             "--mcp-config", tmp.name,
             "--allowedTools", "WebSearch", "WebFetch",

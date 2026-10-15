@@ -15,11 +15,13 @@ Historical 2026-06-24/25 runs used 200 queries x 10 categories and 50 compare ID
 | 3-way depth (n=50) | 7,321 words FULL content/query | Argus edge |
 | Semantic rerank nDCG@5 (n=50) | lexical 0.7373 -> hybrid 0.8428 | +14.3% |
 | Rerank on conceptual/how-to subset (n=19) | lexical 0.6074 -> hybrid 0.7729 | +27.3% |
+| **2026-10-15 vs Claude Code native tools** ([report](2026-10-15-native-vs-argus.md)) | search: 10 hits with snippets from 2.5 engines, top-3 relevance 0.71 vs 0.48, p50 3.8 s vs 6.4 s; read: full page (median 12.7k words, PDFs included) vs a 290-word model summary, gold F1 0.91 vs 0.08 | Argus edge on depth, relevance, latency, cost |
 
 ## Contents
 
 - [At a glance](#at-a-glance)
 - [Argus search - 200 scenarios](#argus-search---200-scenarios-paced-4s)
+- [2026-10-15: vs Claude Code native WebSearch/WebFetch](2026-10-15-native-vs-argus.md) (separate report)
 - [3-way: Argus vs Claude WebSearch vs Codex CLI](#3-way-argus-vs-claude-websearch-vs-codex-cli-n25-then-n50)
 - [Burst re-validation](#burst-re-validation-un-paced-15-queries)
 - [Findings -> actions taken](#findings---actions-taken)

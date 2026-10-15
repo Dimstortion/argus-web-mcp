@@ -50,6 +50,22 @@ pruning, and nothing else on the path was above 25 ms. Two changes, both measure
   gate for the balanced pass was simulated first and rejected: every threshold cost F1
   (0.817 -> 0.810 at best).
 
+### Benchmark: vs Claude Code native WebSearch / WebFetch (2026-10-15)
+
+`benchmark/reports/2026-10-15-native-vs-argus.md`, harness in `benchmark/native/`. The
+native tools' own output was captured verbatim from a headless `claude -p` stream, Argus
+was called over MCP on the production VPS, and `run_4way.py` compared the two end to end
+(24 scenarios, 8 categories, 16 URLs). Search: Argus 10 hits with snippets from 2.5
+named engines vs native 9 links plus one backend-written summary; top-3 relevance 0.71 vs
+0.48; tool latency p50 3.8 s vs 6.4 s. Read: Argus returns the page (median 12.7k words,
+PDFs included) in 2.0 s p50; WebFetch returns a 290-word model summary, declines verbatim
+requests on 13/16 pages, sees 100k chars per call and cannot read PDFs; token F1 against
+gold 0.91 vs 0.08. Agent level, same prompt and model: both answer 24/24, Argus costs 36%
+less per query ($0.136 vs $0.211) and cites 5.1 vs 6.7 sources, but is slower end to end
+(p50 40 s vs 28 s, p95 76 s vs 37 s) because the agent reads ~8k words of real content
+before writing. The 4-way harness now passes `--setting-sources ""` so the fixed CLI
+overhead no longer depends on the operator's CLAUDE.md.
+
 ### Not changed, measured
 
 `visible_text_len` 5-11 ms, `_looks_blocked` 14-25 ms, semantic rerank 50-130 ms for
