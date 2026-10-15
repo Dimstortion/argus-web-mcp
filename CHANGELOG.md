@@ -14,6 +14,52 @@ All notable changes, in [Keep a Changelog](https://keepachangelog.com/) style. D
 
 ---
 
+## [0.4.32] - 2026-10-15 - the "everything else" batch: brief research, read cap, npm adapter, engine alert, Indonesian benchmark
+
+Worked from the 2026-10-15 benchmark's open list, every item measured.
+
+### Added
+
+- **`research(mode='brief')`**: deep trimmed for a short answer, highlights on and 2,500
+  chars per source (about a third of deep's tokens); the docstring steers short syntheses
+  there. The agent-level run showed Argus 42% cheaper but reading 8k words for a
+  5-sentence answer.
+- **`read(max_chars=...)`**: opt-in cap with `truncated` + `full_chars`, same contract as
+  research; the cache keeps the full page. A 300-page PDF came back as 271k words.
+- **npm registry adapter** (`fetch/adapters.py`): npmjs.com package pages block the VPS
+  directly and through WARP; `registry.npmjs.org` serves the readme, so the fetch ladder
+  uses it like the StackExchange API.
+- **Engine liveness alert**: the daily reachability run now also probes every configured
+  search engine (`reachability.measure_engines`); an engine that answered nothing two runs
+  in a row appears in `/health` as `engines_dead`. A free engine that starts blocking
+  the IP used to fail silently behind the others. **Operator step** (the contributing
+  token lacks the `workflow` scope, so this is not in the PR): add to `uptime.yml` after
+  the `egress_hosts_failing` check:
+  `if echo "$body" | grep -q '"engines_dead"'; then echo "::error::a search engine is dead
+  from this IP (see /health engines_dead)"; exit 1; fi`.
+
+### Fixed
+
+- A tool call whose arguments fail the schema (a wrong parameter name, a bad enum) was
+  reported as `internal_error`; it is `schema_invalid` now, so the caller knows to fix the
+  call. Found when a harness with wrong argument names read four tools as broken.
+
+### Measured, not changed
+
+- **Indonesian queries** (16 across the 8 categories, same harness as the English run):
+  Argus returns 10 hits with 106 Indonesian-language results out of 160 and 35 on `.id`
+  domains, against native WebSearch's 63 of 147 and 31; search p50 4.0 s vs 8.0 s;
+  research 5 sources, 5,960 words, p95 18.4 s. Reads: 4 of 6 Indonesian pages full
+  (id.wikipedia, bi.go.id, cnbcindonesia), `kemenperin.go.id` refuses the VPS (works from
+  a residential IP: candidate for `ARGUS_EGRESS_PROXY_HOSTS`) and `idx.co.id` is a
+  Cloudflare wall from everywhere. Native WebFetch summarised all 6.
+- **Other tools** on the live VPS: `smart_search` routes 7/8 as intended (alphafold goes
+  to `scholar` rather than `science`), `map_urls` 152 URLs from the sitemap in 0.2 s,
+  `github_search` 5 repos in 0.9 s, `scholar_search` 5 papers in 1.5 s, `find_similar` 5
+  in 4.8 s, `crawl` 3 pages in 1.6 s, `batch_read` 4/4 in 3.6 s.
+- Search result dates: still none from SearXNG for the engines reachable here (0.4.30
+  note stands; VPS-side).
+
 ## [0.4.31] - 2026-10-15 - review fixes on the 0.4.28-0.4.30 merge
 
 Two findings from an independent review of the contributed 0.4.28-0.4.30 commits.
