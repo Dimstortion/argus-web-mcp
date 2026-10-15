@@ -87,7 +87,8 @@ def _looks_blocked(html: str, status: int | None) -> bool:
     # Markers can be class names, so scan the markup (bounded above), not the visible text;
     # inline JS pushes them past any fixed prefix, and the thin gate keeps a real article
     # that quotes "access denied" from counting as a wall.
-    return vlen < _CHALLENGE_TEXT_MAX and any(m in html.lower() for m in _BLOCK_MARKERS)
+    low = html.lower()
+    return vlen < _CHALLENGE_TEXT_MAX and any(m in low for m in _BLOCK_MARKERS)
 
 
 def _challenge_headers(resp: httpx.Response) -> bool:

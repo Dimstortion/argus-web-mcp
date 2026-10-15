@@ -31,7 +31,15 @@ pruning, and nothing else on the path was above 25 ms. Two changes, both measure
   parent runs ONNX and Chromium threads), import only the extract package (~55 MB each),
   are warmed at startup and rebuilt once if one dies (OOM kill). The suite runs with
   `ARGUS_EXTRACT_WORKERS=0` (a spawned worker would not see monkeypatches); one test
-  exercises a real worker.
+  exercises a real worker. Validated five ways before shipping: a call-site and docs
+  audit, the offline suite plus the server/research suites run through a real worker,
+  a live HTTP server (two workers warmed, `read`/`batch_read` over MCP, a worker killed
+  with the next read still 200, graceful shutdown leaving no orphan process), the
+  held-out WCXB test split (511 pages: F1 0.854 -> 0.858, -34% time), and an independent
+  review. The review found and fixed a race (callers that hit the same dead pool at once
+  each retired the other's replacement; now only the pool that broke is retired), a
+  crash on a non-numeric `ARGUS_EXTRACT_WORKERS` (falls back to the default), and added
+  a thread fallback plus a logged warm-up when workers cannot spawn at all.
 - **One trafilatura pass instead of two.** The precision-then-balanced pair from 0.4.22
   was re-measured on the full WCXB dev split (1497 pages): pair 0.815 F1 / 471 s,
   balanced alone 0.817 F1 / 287 s (-39%, p95 per page 0.99 -> 0.62 s), and balanced keeps
