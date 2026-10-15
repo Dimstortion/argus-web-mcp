@@ -167,3 +167,12 @@ async def test_fetch_ladder_uses_npm_adapter_when_page_blocks():
     async with httpx.AsyncClient() as c:
         res = await fetch(NPM_URL, client=c, browser=None, timeout=10)
     assert res["render_path"] == "api" and "A tiny package." in res["html"]
+
+
+@respx.mock
+async def test_fetch_npm_escapes_registry_markup():
+    doc = {**NPM_DOC, "readme": "x </pre><script>alert(1)</script> if a < b"}
+    respx.get(NPM_API).mock(return_value=httpx.Response(200, json=doc))
+    async with httpx.AsyncClient() as c:
+        res = await fetch_npm(NPM_URL, client=c)
+    assert "<script>" not in res["html"] and "&lt;/pre&gt;" in res["html"]

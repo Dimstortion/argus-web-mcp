@@ -16,6 +16,17 @@ All notable changes, in [Keep a Changelog](https://keepachangelog.com/) style. D
 
 ## [0.4.33] - 2026-10-15 - authority prior in the rerank, after a blind judge said the answers were worse-sourced
 
+### Review fixes (before merge)
+
+- `is_authoritative` matched domain entries as raw suffixes, so `minecraft.com` and
+  `lyft.com` passed as `ft.com`, `evilgithub.com` as `github.com`. Entries now match on a
+  label boundary (`host == d` or `*.d`); TLD entries (`.gov`, `.org`) were already safe.
+- `fetch_npm` escapes the registry's readme, description and homepage before wrapping
+  them in HTML: readmes embed markup and code samples carry `<`, which broke extraction.
+- CI pins `uv venv --python 3.12.15` (the prod image's version). The runner's system
+  3.12.3 predates the 3.12.4 fix that delegates IPv4-mapped address properties, so
+  `::ffff:8.8.8.8` read as reserved and `main` had been red since 0.4.28.
+
 ### The finding
 
 A blind pairwise LLM judge (Claude Sonnet 5.5, A/B order randomised, then re-run with the

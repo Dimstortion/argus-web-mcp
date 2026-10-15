@@ -91,6 +91,7 @@ _AUTHORITY_SUFFIXES = (
     "acm.org", "reuters.com", "bloomberg.com", "ft.com", "wsj.com", "nytimes.com",
     "theguardian.com", "bbc.co.uk", "bbc.com", "iea.org", "nist.gov", "europa.eu",
 )
+_AUTHORITY_DOMAINS = tuple(s if s.startswith(".") else "." + s for s in _AUTHORITY_SUFFIXES)
 _TOKEN_RE = re.compile(r"[a-z0-9]+")
 # Hybrid semantic rerank (auto-enabled when argus.semantic.available()).
 # Blended score = _SEM_WEIGHT * cosine + (1 - _SEM_WEIGHT) * lexical_norm. Semantic-leaning
@@ -204,7 +205,8 @@ def is_authoritative(url: str) -> bool:
     """Domain-class prior for the rerank: official docs, encyclopedic, academic, code
     hosts, government/education, standards bodies and major newsrooms."""
     host = _host(url).removeprefix("www.")
-    return host.startswith(_AUTHORITY_PREFIXES) or host.endswith(_AUTHORITY_SUFFIXES)
+    # Match on a label boundary: "minecraft.com" must not pass as "ft.com".
+    return host.startswith(_AUTHORITY_PREFIXES) or ("." + host).endswith(_AUTHORITY_DOMAINS)
 
 
 def _host(url: str) -> str:

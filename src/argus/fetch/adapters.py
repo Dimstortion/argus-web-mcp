@@ -10,6 +10,7 @@ injected client, so every hop keeps the SSRF guard and the size cap.
 from __future__ import annotations
 
 import asyncio
+import html
 import json
 import re
 import time
@@ -104,14 +105,16 @@ async def fetch_npm(url: str, *, client, timeout: float = 30) -> dict | None:
         data = json.loads((await fetch_static(
             f"https://registry.npmjs.org/{name}", client=client, timeout=timeout))["html"])
         latest = (data.get("dist-tags") or {}).get("latest", "")
-        meta = f"<p>Latest version: {latest}</p>" if latest else ""
+        meta = f"<p>Latest version: {html.escape(str(latest))}</p>" if latest else ""
         if data.get("homepage"):
-            meta += f'<p>Homepage: <a href="{data["homepage"]}">{data["homepage"]}</a></p>'
-        readme = data.get("readme") or ""
+            home = html.escape(str(data["homepage"]))
+            meta += f'<p>Homepage: <a href="{home}">{home}</a></p>'
+        readme = html.escape(str(data.get("readme") or ""))
+        desc = html.escape(str(data.get("description") or ""))
     except Exception:  # noqa: BLE001 - any failure must degrade to None, never raise
         return None
     # The readme is markdown; <pre> keeps it readable and verbatim through extraction.
-    html = (f"<html><head><title>{name}</title></head><body><article><h1>{name}</h1>"
-            f"<p>{data.get('description', '')}</p>{meta}<pre>{readme}</pre>"
-            "</article></body></html>")
-    return {"final_url": url, "status": 200, "html": html, "render_path": "api"}
+    # Registry text is untrusted markup (readmes embed HTML, code samples carry `<`).
+    page = (f"<html><head><title>{name}</title></head><body><article><h1>{name}</h1>"
+            f"<p>{desc}</p>{meta}<pre>{readme}</pre></article></body></html>")
+    return {"final_url": url, "status": 200, "html": page, "render_path": "api"}

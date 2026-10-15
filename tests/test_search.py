@@ -2014,3 +2014,15 @@ def test_authority_prior_lifts_official_docs_over_an_equal_seo_page():
            "snippet": "permits", "engine": "bing"}
     ranked = rerank(q, [seo, off], semantic_rerank=False)
     assert ranked[0]["url"] == seo["url"]
+
+
+@pytest.mark.parametrize("url,expected", [
+    ("https://github.com/x/y", True), ("https://gist.github.com/x", True),
+    ("https://www.ft.com/a", True), ("https://example.org/", True),
+    ("https://minecraft.com/", False), ("https://lyft.com/", False),
+    ("https://evilgithub.com/", False), ("https://fakepython.org.example/", False),
+])
+def test_authority_prior_matches_on_a_label_boundary(url, expected):
+    from argus.search import is_authoritative
+
+    assert is_authoritative(url) is expected
